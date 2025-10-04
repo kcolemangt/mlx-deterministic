@@ -2,14 +2,17 @@
 """
 OpenAI-Compatible API Server with Deterministic Inference
 
-This creates an API endpoint that LM Studio can connect to.
-Compatible with OpenAI's chat completions API format.
+This creates an API server compatible with OpenAI's chat completions API format.
+Supports deterministic inference using batch-invariant operations.
 
 Usage:
-    python examples/lm_studio_compatible_server.py
+    python examples/openai_compatible_server.py
 
-Then in LM Studio:
-    Settings → Developer → Base URL → http://localhost:8000/v1
+    # With custom model
+    python examples/openai_compatible_server.py --model mlx-community/Qwen3-8B-4bit
+
+    # With local model
+    python examples/openai_compatible_server.py --model /path/to/local/model
 """
 
 from fastapi import FastAPI, HTTPException
@@ -268,7 +271,6 @@ async def chat_completions(request: ChatCompletionRequest):
             tokenizer=TOKENIZER,
             prompt=prompt,
             max_tokens=request.max_tokens,
-            temp=request.temperature,
             verbose=False
         )
 
@@ -326,8 +328,8 @@ if __name__ == "__main__":
     print(f"\nServer will start on: http://{args.host}:{args.port}")
     print(f"OpenAI API compatible endpoint: /v1/chat/completions")
     print(f"Deterministic mode: {'Enabled on startup' if args.deterministic else 'Use deterministic=true in request'}")
-    print(f"\nFor LM Studio:")
-    print(f"  Settings → Developer → Base URL → http://localhost:{args.port}/v1")
+    print(f"\nBase URL for OpenAI-compatible clients:")
+    print(f"  http://localhost:{args.port}/v1")
     print("\nStarting server...\n")
 
     uvicorn.run(app, host=args.host, port=args.port)

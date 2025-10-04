@@ -1,14 +1,14 @@
-# LM Studio Integration Guide
+# OpenAI-Compatible API Server
 
-This guide shows how to use MLX Deterministic Inference as an endpoint for **LM Studio**.
+This provides an **OpenAI-compatible API server** with deterministic inference support for MLX models.
 
 ## 🎯 What This Does
 
-Creates an **OpenAI-compatible API server** that:
-- ✅ Works with LM Studio's API endpoint feature
-- ✅ Supports deterministic inference mode
+Creates an API server that:
+- ✅ Provides OpenAI-compatible endpoints
+- ✅ Supports deterministic inference mode (batch-invariant operations)
 - ✅ Uses MLX for Apple Silicon optimization
-- ✅ Compatible with OpenAI client libraries
+- ✅ Works with any OpenAI-compatible client
 
 ## 🚀 Quick Start
 
@@ -23,31 +23,20 @@ pip install fastapi uvicorn
 ### 2. Start the Server
 
 ```bash
-# Basic usage (Qwen2.5-7B-Instruct-4bit)
-python examples/lm_studio_compatible_server.py
+# Basic usage (downloads Qwen2.5-7B-Instruct-4bit)
+python examples/openai_compatible_server.py
 
 # Or specify a different model
-python examples/lm_studio_compatible_server.py --model mlx-community/Llama-3.2-3B-Instruct-4bit
+python examples/openai_compatible_server.py --model mlx-community/Llama-3.2-3B-Instruct-4bit
 
-# Enable deterministic mode by default
-python examples/lm_studio_compatible_server.py --deterministic
+# Or use a local model path
+python examples/openai_compatible_server.py --model /path/to/your/mlx/model
+
+# Custom port
+python examples/openai_compatible_server.py --port 8001
 ```
 
-Server will start on: **http://localhost:8000**
-
-### 3. Configure LM Studio
-
-In LM Studio:
-
-1. **Settings** → **Developer** → **API Server**
-2. Set **Base URL**: `http://localhost:8000/v1`
-3. Click **Test Connection**
-
-You should see: ✓ Connected
-
-### 4. Use in LM Studio
-
-Now you can use LM Studio as normal, but it will connect to your MLX deterministic inference server!
+Server will start on: **http://localhost:8000** (or your specified port)
 
 ## 🎛️ API Usage
 
@@ -62,7 +51,6 @@ curl -X POST http://localhost:8000/v1/chat/completions \
     "messages": [
       {"role": "user", "content": "What is the capital of France?"}
     ],
-    "temperature": 0.0,
     "max_tokens": 100
   }'
 
@@ -74,7 +62,6 @@ curl -X POST http://localhost:8000/v1/chat/completions \
     "messages": [
       {"role": "user", "content": "What is the capital of France?"}
     ],
-    "temperature": 0.0,
     "max_tokens": 100,
     "deterministic": true
   }'
@@ -96,8 +83,7 @@ response = client.chat.completions.create(
     model="mlx-deterministic",
     messages=[
         {"role": "user", "content": "What is the capital of France?"}
-    ],
-    temperature=0.0
+    ]
 )
 
 print(response.choices[0].message.content)
@@ -108,7 +94,6 @@ response = client.chat.completions.create(
     messages=[
         {"role": "user", "content": "What is the capital of France?"}
     ],
-    temperature=0.0,
     extra_body={"deterministic": True}  # Enable batch-invariant ops
 )
 
@@ -118,13 +103,12 @@ print(response.choices[0].message.content)
 ## 🔧 Server Options
 
 ```bash
-python examples/lm_studio_compatible_server.py --help
+python examples/openai_compatible_server.py --help
 
 Options:
   --host HOST            Host to bind to (default: 0.0.0.0)
   --port PORT            Port to bind to (default: 8000)
   --model MODEL          Model to load (default: Qwen2.5-7B-Instruct-4bit)
-  --deterministic        Enable deterministic mode on startup
 ```
 
 ## 📊 Endpoints
@@ -165,7 +149,6 @@ for i in range(10):
     response = client.chat.completions.create(
         model="mlx-deterministic",
         messages=[prompt],
-        temperature=0.0,
         extra_body={"deterministic": True}
     )
     responses.append(response.choices[0].message.content)
@@ -195,12 +178,12 @@ curl http://localhost:8000/health
 ## 🐛 Troubleshooting
 
 ### "Model not loaded"
-- Make sure the model is downloaded first
-- Use MLX-LM to download: `mlx_lm.convert --model <model_name>`
+- Make sure the model path is correct
+- For Hugging Face models, they will download automatically on first use
 
-### "Connection refused" in LM Studio
+### "Connection refused"
 - Check server is running: `curl http://localhost:8000/health`
-- Verify port is 8000
+- Verify port number
 - Check firewall settings
 
 ### Slow responses
@@ -214,43 +197,31 @@ Any MLX-compatible model works:
 
 ```bash
 # Qwen (recommended)
-python examples/lm_studio_compatible_server.py --model mlx-community/Qwen2.5-7B-Instruct-4bit
+python examples/openai_compatible_server.py --model mlx-community/Qwen2.5-7B-Instruct-4bit
 
 # Llama
-python examples/lm_studio_compatible_server.py --model mlx-community/Llama-3.2-3B-Instruct-4bit
+python examples/openai_compatible_server.py --model mlx-community/Llama-3.2-3B-Instruct-4bit
 
 # Mistral
-python examples/lm_studio_compatible_server.py --model mlx-community/Mistral-7B-Instruct-v0.3-4bit
-```
+python examples/openai_compatible_server.py --model mlx-community/Mistral-7B-Instruct-v0.3-4bit
 
-## 🎓 Advanced: Production Deployment
-
-For production use:
-
-```bash
-# Use gunicorn for better performance
-pip install gunicorn
-
-gunicorn examples.lm_studio_compatible_server:app \
-  --workers 4 \
-  --worker-class uvicorn.workers.UvicornWorker \
-  --bind 0.0.0.0:8000
+# Local model
+python examples/openai_compatible_server.py --model /path/to/your/mlx/model
 ```
 
 ## 🔗 Integration with Other Tools
 
 This server works with any tool that supports OpenAI's API:
 
-- **LM Studio** ✅
-- **Cursor** (AI code editor)
-- **Continue** (VS Code extension)
-- **LangChain** (Python framework)
-- **Anything using OpenAI client**
+- **OpenAI Python SDK** ✅
+- **Cursor** (AI code editor) ✅
+- **Continue.dev** (VS Code extension) ✅
+- **LangChain** (Python framework) ✅
+- **Any OpenAI-compatible client** ✅
 
 Just point the base URL to `http://localhost:8000/v1`!
 
 ## 📚 More Information
 
 - [Main Integration Guide](../INTEGRATION_GUIDE.md)
-- [Repository](https://github.com/ProbioticFarmer/mlx-deterministic)
 - [MLX-LM Documentation](https://github.com/ml-explore/mlx-lm)
