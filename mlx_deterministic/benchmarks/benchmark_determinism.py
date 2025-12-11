@@ -9,20 +9,181 @@ Now includes comprehensive comparison of:
 1. Original implementation (K-dimension tiling)
 2. New Python implementation (2D output tiling)
 3. Metal kernel implementation (bitwise determinism)
+
+Usage:
+    # Standard benchmark (quick)
+    python benchmark_determinism.py
+
+    # Extended benchmark (stable results, thermal-aware)
+    python benchmark_determinism.py --extended
+
+    # Extended with custom settings
+    python benchmark_determinism.py --extended --cooldown 5 --rounds 3
 """
 
+import argparse
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 import time
 import statistics
-from typing import Callable, Any, Dict
+from typing import Callable, Any, Dict, List, Optional
 from mlx_deterministic.ops import (
     BatchInvariantRMSNorm,
     batch_invariant_matmul,
     BatchInvariantAttention,
     batch_invariant_softmax
 )
+
+
+# =============================================================================
+# CLI ARGUMENT PARSING
+# =============================================================================
+
+def parse_args() -> argparse.Namespace:
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Benchmark MLX deterministic operations",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python benchmark_determinism.py              # Standard quick benchmark
+  python benchmark_determinism.py --extended   # Extended thermal-aware benchmark
+  python benchmark_determinism.py --extended --cooldown 5 --rounds 3
+        """
+    )
+    parser.add_argument(
+        '--extended', action='store_true',
+        help='Run extended benchmark with interleaved tests and cooldown for stable results'
+    )
+    parser.add_argument(
+        '--cooldown', type=float, default=5.0,
+        help='Seconds to sleep between test categories for thermal recovery (default: 5.0)'
+    )
+    parser.add_argument(
+        '--rounds', type=int, default=3,
+        help='Number of complete benchmark rounds in extended mode (default: 3)'
+    )
+    return parser.parse_args()
+
+
+# =============================================================================
+# THERMAL-AWARE BENCHMARKING (Extended Mode)
+# =============================================================================
+
+def cooldown(seconds: float, message: str = "Cooling down") -> None:
+    """
+    Sleep to let machine return to thermal equilibrium.
+
+    Args:
+        seconds: Time to sleep in seconds
+        message: Message to display during cooldown
+    """
+    print(f"  {message} ({seconds:.1f}s)...", end=" ", flush=True)
+    time.sleep(seconds)
+    print("done")
+
+
+def interleaved_benchmark(
+    implementations: Dict[str, Callable],
+    min_runtime_sec: float = 5.0,
+    target_cv: float = 0.05,
+    max_iterations: int = 5000,
+    min_iterations: int = 500,
+    warmup_per_impl: int = 20,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Run implementations in interleaved fashion for fair thermal comparison.
+
+    Instead of running [A x1000, B x1000], runs [A, B, A, B, ...] ensuring
+    all implementations experience similar thermal conditions. Uses adaptive
+    stopping based on time and coefficient of variation for stable results.
+
+    Args:
+        implementations: Dict mapping name -> callable (no args)
+        min_runtime_sec: Minimum total runtime before checking for stability
+        target_cv: Target coefficient of variation for all implementations (0.05 = 5%)
+        max_iterations: Safety cap on iterations per implementation
+        min_iterations: Minimum iterations even if CV target is met early
+        warmup_per_impl: Warmup iterations per implementation before timing
+
+    Returns:
+        Dict mapping name -> statistics dict with mean_ms, std_ms, median_ms, etc.
+    """
+    # Warmup all implementations first (in rotation to warm caches fairly)
+    impl_names = list(implementations.keys())
+    print(f"    Warming up ({warmup_per_impl} iterations each)...", end=" ", flush=True)
+    for _ in range(warmup_per_impl):
+        for name in impl_names:
+            out = implementations[name]()
+            mx.eval(out)
+    print("done")
+
+    # Interleaved timing collection
+    samples: Dict[str, List[float]] = {name: [] for name in implementations}
+    total_time = 0.0
+    check_interval = 50  # Check stopping conditions every N iterations
+    iteration = 0
+
+    print(f"    Running (min {min_runtime_sec}s, target CV <{target_cv*100:.0f}%)...", end=" ", flush=True)
+
+    while iteration < max_iterations:
+        # Rotate starting position each iteration to avoid order bias
+        # e.g., iteration 0: [A, B, C], iteration 1: [B, C, A], iteration 2: [C, A, B]
+        start_idx = iteration % len(impl_names)
+        order = impl_names[start_idx:] + impl_names[:start_idx]
+
+        for name in order:
+            start = time.perf_counter()
+            out = implementations[name]()
+            mx.eval(out)
+            elapsed = time.perf_counter() - start
+            samples[name].append(elapsed * 1000)  # Convert to ms
+            total_time += elapsed
+
+        iteration += 1
+
+        # Check stopping conditions periodically (after minimum iterations)
+        if iteration % check_interval == 0 and iteration >= min_iterations:
+            if total_time >= min_runtime_sec:
+                # Check if all implementations have stable results (CV < target)
+                all_stable = True
+                for name, times in samples.items():
+                    if len(times) > 1:
+                        mean = statistics.mean(times)
+                        std = statistics.stdev(times)
+                        cv = std / mean if mean > 0 else float('inf')
+                        if cv >= target_cv:
+                            all_stable = False
+                            break
+                if all_stable:
+                    break
+
+    print(f"done ({iteration} iterations, {total_time:.1f}s)")
+
+    # Compute statistics for each implementation
+    results = {}
+    for name, times in samples.items():
+        sorted_times = sorted(times)
+        n = len(times)
+        mean = statistics.mean(times)
+        std = statistics.stdev(times) if n > 1 else 0.0
+        results[name] = {
+            'mean_ms': mean,
+            'std_ms': std,
+            'cv': std / mean if mean > 0 else 0.0,
+            'median_ms': statistics.median(times),
+            'min_ms': min(times),
+            'max_ms': max(times),
+            'p95_ms': sorted_times[int(n * 0.95)] if n >= 20 else sorted_times[-1],
+            'iterations': n,
+        }
+    return results
+
+
+def compute_overhead(result: Dict[str, Any], baseline: Dict[str, Any]) -> float:
+    """Compute percentage overhead relative to baseline."""
+    return ((result['median_ms'] - baseline['median_ms']) / baseline['median_ms']) * 100
 
 
 # =============================================================================
@@ -355,6 +516,235 @@ def benchmark_attention_determinism():
     return len(unique_outputs) == 1
 
 
+def benchmark_extended(
+    cooldown_sec: float = 5.0,
+    rounds: int = 3,
+    min_runtime_sec: float = 5.0,
+) -> Dict[str, Any]:
+    """
+    Extended benchmark mode with thermal-aware testing for stable results.
+
+    Features:
+    - Interleaved testing: All implementations run in rotation, not sequentially
+    - Adaptive iterations: Runs until results stabilize (CV < 5%) with min runtime
+    - Cooldown periods: Sleep between test categories to recover from thermal throttling
+    - Multiple rounds: Run complete benchmark multiple times, report median results
+    - Relative focus: Emphasizes overhead ratios over absolute times
+
+    This addresses the problem where later tests run slower due to thermal throttling,
+    unfairly penalizing implementations that happen to be benchmarked last.
+
+    Args:
+        cooldown_sec: Seconds to sleep between test categories
+        rounds: Number of complete benchmark rounds
+        min_runtime_sec: Minimum runtime per benchmark category (adaptive iterations)
+
+    Returns:
+        Dict with all benchmark results across rounds
+    """
+    print("\n" + "="*80)
+    print("EXTENDED BENCHMARK MODE (thermal-aware)")
+    print("="*80)
+    print(f"\nConfiguration:")
+    print(f"  Rounds: {rounds}")
+    print(f"  Min runtime per test: {min_runtime_sec}s (adaptive iterations until CV <5%)")
+    print(f"  Cooldown between categories: {cooldown_sec}s")
+    print(f"  Testing method: Interleaved (fair thermal comparison)")
+    print("-"*80)
+
+    # Import Metal kernel implementations
+    try:
+        from mlx_deterministic.ops.metal_matmul import deterministic_matmul_metal
+        from mlx_deterministic.ops.metal_rms_norm import BatchInvariantRMSNormMetal
+        metal_available = True
+    except ImportError as e:
+        print(f"Warning: Metal kernels not available: {e}")
+        metal_available = False
+
+    all_round_results: List[Dict[str, Any]] = []
+
+    for round_num in range(1, rounds + 1):
+        print(f"\n{'='*80}")
+        print(f"ROUND {round_num}/{rounds}")
+        print("="*80)
+
+        round_results = {}
+
+        # Initial cooldown to start from thermal equilibrium
+        if round_num > 1:
+            cooldown(cooldown_sec * 2, "Inter-round cooldown")
+
+        # ====================================================================
+        # RMSNorm Benchmark
+        # ====================================================================
+        print(f"\n  RMSNorm (batch=32, dims=2048)")
+
+        dims = 2048
+        mx.random.seed(42)
+        x = mx.random.normal((32, dims))
+
+        std_norm = nn.RMSNorm(dims)
+        metal_norm = BatchInvariantRMSNormMetal(dims) if metal_available else None
+
+        implementations = {"Standard": lambda: std_norm(x)}
+        if metal_available:
+            implementations["Metal"] = lambda: metal_norm(x)
+
+        results = interleaved_benchmark(implementations, min_runtime_sec=min_runtime_sec)
+        round_results['rmsnorm'] = results
+
+        # Print results
+        baseline = results['Standard']['median_ms']
+        print(f"    Standard: {results['Standard']['median_ms']:.3f}ms (median, CV={results['Standard']['cv']*100:.1f}%)")
+        if metal_available:
+            overhead = compute_overhead(results['Metal'], results['Standard'])
+            print(f"    Metal:    {results['Metal']['median_ms']:.3f}ms (median, CV={results['Metal']['cv']*100:.1f}%) [{overhead:+.1f}%]")
+
+        cooldown(cooldown_sec, "Thermal recovery")
+
+        # ====================================================================
+        # Matmul 512x512 Benchmark
+        # ====================================================================
+        print(f"\n  Matmul (512x512 @ 512x512)")
+
+        M, K, N = 512, 512, 512
+        mx.random.seed(42)
+        a = mx.random.normal((M, K))
+        b = mx.random.normal((K, N))
+
+        implementations = {
+            "Standard": lambda: mx.matmul(a, b),
+        }
+        if metal_available:
+            implementations["Metal"] = lambda: batch_invariant_matmul(a, b, use_metal_kernel=True)
+
+        results = interleaved_benchmark(implementations, min_runtime_sec=min_runtime_sec)
+        round_results['matmul_512'] = results
+
+        baseline = results['Standard']['median_ms']
+        print(f"    Standard: {results['Standard']['median_ms']:.3f}ms (median, CV={results['Standard']['cv']*100:.1f}%)")
+        if metal_available:
+            overhead = compute_overhead(results['Metal'], results['Standard'])
+            print(f"    Metal:    {results['Metal']['median_ms']:.3f}ms (median, CV={results['Metal']['cv']*100:.1f}%) [{overhead:+.1f}%]")
+
+        cooldown(cooldown_sec, "Thermal recovery")
+
+        # ====================================================================
+        # Large Matmul 2048x2048 Benchmark (FP32)
+        # ====================================================================
+        print(f"\n  Large Matmul FP32 (2048x2048 @ 2048x2048)")
+
+        M, K, N = 2048, 2048, 2048
+        mx.random.seed(42)
+        a_large = mx.random.normal((M, K))
+        b_large = mx.random.normal((K, N))
+
+        implementations = {
+            "Standard": lambda: mx.matmul(a_large, b_large),
+        }
+        if metal_available:
+            implementations["Metal"] = lambda: batch_invariant_matmul(a_large, b_large, use_metal_kernel=True)
+
+        results = interleaved_benchmark(implementations, min_runtime_sec=min_runtime_sec)
+        round_results['matmul_2k_fp32'] = results
+
+        baseline = results['Standard']['median_ms']
+        print(f"    Standard: {results['Standard']['median_ms']:.3f}ms (median, CV={results['Standard']['cv']*100:.1f}%)")
+        if metal_available:
+            overhead = compute_overhead(results['Metal'], results['Standard'])
+            print(f"    Metal:    {results['Metal']['median_ms']:.3f}ms (median, CV={results['Metal']['cv']*100:.1f}%) [{overhead:+.1f}%]")
+
+        cooldown(cooldown_sec, "Thermal recovery")
+
+        # ====================================================================
+        # Large Matmul 2048x2048 Benchmark (FP16)
+        # ====================================================================
+        print(f"\n  Large Matmul FP16 (2048x2048 @ 2048x2048)")
+
+        mx.random.seed(42)
+        a_fp16 = mx.random.normal((M, K)).astype(mx.float16)
+        b_fp16 = mx.random.normal((K, N)).astype(mx.float16)
+
+        implementations = {
+            "Standard": lambda: mx.matmul(a_fp16, b_fp16),
+        }
+        if metal_available:
+            implementations["Metal"] = lambda: batch_invariant_matmul(a_fp16, b_fp16, use_metal_kernel=True)
+
+        results = interleaved_benchmark(implementations, min_runtime_sec=min_runtime_sec)
+        round_results['matmul_2k_fp16'] = results
+
+        baseline = results['Standard']['median_ms']
+        print(f"    Standard: {results['Standard']['median_ms']:.3f}ms (median)")
+        if metal_available:
+            overhead = compute_overhead(results['Metal'], results['Standard'])
+            print(f"    Metal:    {results['Metal']['median_ms']:.3f}ms (median) [{overhead:+.1f}%]")
+
+        all_round_results.append(round_results)
+
+    # ========================================================================
+    # Aggregate results across rounds
+    # ========================================================================
+    print("\n" + "="*80)
+    print(f"FINAL RESULTS (median of {rounds} rounds)")
+    print("="*80)
+
+    # Compute median overhead across rounds for each category
+    final_results = {}
+    categories = ['rmsnorm', 'matmul_512', 'matmul_2k_fp32', 'matmul_2k_fp16']
+    category_names = ['RMSNorm', 'Matmul 512', 'Matmul 2K (FP32)', 'Matmul 2K (FP16)']
+
+    print("\n| Operation | Standard | Metal | Overhead |")
+    print("|-----------|----------|-------|----------|")
+
+    for cat, cat_name in zip(categories, category_names):
+        std_medians = [r[cat]['Standard']['median_ms'] for r in all_round_results]
+        std_final = statistics.median(std_medians)
+
+        if metal_available and 'Metal' in all_round_results[0][cat]:
+            metal_medians = [r[cat]['Metal']['median_ms'] for r in all_round_results]
+            metal_final = statistics.median(metal_medians)
+
+            # Compute overhead for each round and get range
+            overheads = []
+            for r in all_round_results:
+                oh = compute_overhead(r[cat]['Metal'], r[cat]['Standard'])
+                overheads.append(oh)
+
+            overhead_median = statistics.median(overheads)
+            overhead_min = min(overheads)
+            overhead_max = max(overheads)
+
+            # Show range if variance is significant
+            if overhead_max - overhead_min > 5:
+                overhead_str = f"{overhead_median:+.0f}% ({overhead_min:+.0f} to {overhead_max:+.0f})"
+            else:
+                overhead_str = f"{overhead_median:+.0f}%"
+
+            print(f"| {cat_name:<17} | {std_final:.2f}ms | {metal_final:.2f}ms | {overhead_str} |")
+
+            final_results[cat] = {
+                'standard_ms': std_final,
+                'metal_ms': metal_final,
+                'overhead_pct': overhead_median,
+                'overhead_range': (overhead_min, overhead_max),
+            }
+        else:
+            print(f"| {cat_name:<17} | {std_final:.2f}ms | N/A | N/A |")
+            final_results[cat] = {
+                'standard_ms': std_final,
+                'metal_ms': None,
+                'overhead_pct': None,
+            }
+
+    print("\nNotes:")
+    print("  - Metal kernel provides bitwise determinism (0.0 difference)")
+    print("  - Interleaved testing ensures fair thermal comparison")
+    print(f"  - Results are median of {rounds} complete rounds")
+
+    return final_results
+
+
 def benchmark_performance():
     """Benchmark performance overhead (legacy function for compatibility)."""
     # Use the comprehensive benchmark instead
@@ -664,8 +1054,15 @@ def benchmark_all_implementations():
     return results
 
 
-def main():
-    """Run all benchmarks."""
+def main() -> int:
+    """
+    Run all benchmarks.
+
+    Returns:
+        0 if all tests pass, 1 otherwise
+    """
+    args = parse_args()
+
     print("\n" + "#"*70)
     print("# MLX Deterministic Inference Benchmark Suite")
     print("#"*70)
@@ -679,8 +1076,14 @@ def main():
     results.append(("Matmul", benchmark_matmul_determinism()))
     results.append(("Attention", benchmark_attention_determinism()))
 
-    # Run performance benchmark
-    benchmark_performance()
+    # Run performance benchmark (standard or extended mode)
+    if args.extended:
+        benchmark_extended(
+            cooldown_sec=args.cooldown,
+            rounds=args.rounds,
+        )
+    else:
+        benchmark_performance()
 
     # Summary
     print("\n" + "="*70)

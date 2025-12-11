@@ -47,8 +47,8 @@ This library provides **batch-invariant** implementations of core operations:
 
 | Mode | Tolerance | Matmul Overhead | Use Case |
 |------|-----------|-----------------|----------|
-| **Python (default)** | ~1e-5 | +8-20% | Most applications |
-| **Metal Kernels** | **0.0** (bitwise) | **+9-25%** | Strict reproducibility |
+| **Python (default)** | ~1e-5 | +27-32% | Most applications |
+| **Metal Kernels** | **0.0** (bitwise) | **+27-32%** | Strict reproducibility |
 
 > **Why is the Metal kernel slower?** The Python mode wraps MLX's highly-optimized `mx.matmul()` (which uses Apple's hand-tuned GEMM kernels). The Metal kernel implements matmul from scratch to guarantee bitwise determinism - we cannot match Apple's years of optimization work, but we CAN guarantee identical results every time. See [Performance Trade-offs](#performance-trade-offs) for details.
 
@@ -143,12 +143,85 @@ See **[INTEGRATION_GUIDE.md](INTEGRATION_GUIDE.md)** for complete examples.
 ## 🧪 Testing
 
 ```bash
-# Run all tests (59/59 passing)
+# Run all tests (62 passing, 3 xfail for known limitations)
 python -m pytest mlx_deterministic/tests/ -v
 
-# Run determinism validation benchmark
+# Run specific test files
+python -m pytest mlx_deterministic/tests/test_metal_kernels.py -v
+python -m pytest mlx_deterministic/tests/test_matmul.py -v
+```
+
+## 📊 Benchmarking
+
+The benchmark suite validates determinism and measures performance across all implementations.
+
+### Quick Benchmark (Standard Mode)
+
+```bash
+# Fast benchmark (~60 seconds) - good for quick validation
 PYTHONPATH=. python mlx_deterministic/benchmarks/benchmark_determinism.py
 ```
+
+This runs determinism tests and a performance comparison, but results may vary ±10-15% between runs due to thermal throttling.
+
+### Stable Benchmark (Extended Mode)
+
+```bash
+# Thermal-aware benchmark (~5-10 minutes) - recommended for accurate measurements
+PYTHONPATH=. python mlx_deterministic/benchmarks/benchmark_determinism.py --extended
+```
+
+Extended mode provides stable, reproducible results by:
+- **Interleaved testing**: Runs all implementations in rotation (not sequentially), so each experiences the same thermal conditions
+- **Cooldown periods**: Sleeps between test categories to let CPU/GPU recover from thermal throttling
+- **Multiple rounds**: Runs the complete benchmark multiple times and reports median results
+- **Adaptive iterations**: Runs until results stabilize (CV < 5%) with minimum 5 seconds per test
+
+### Benchmark Options
+
+```bash
+# Full options
+python benchmark_determinism.py --extended [OPTIONS]
+
+Options:
+  --cooldown SECONDS   Sleep time between test categories (default: 5.0)
+  --rounds N           Number of complete benchmark rounds (default: 3)
+
+# Examples
+--extended                    # Default extended settings (~10 min)
+--extended --rounds 5         # More thorough (longer)
+--extended --cooldown 10      # Longer cooldown for hot systems
+```
+
+### What the Benchmark Tests
+
+| Test | What It Measures |
+|------|------------------|
+| **Determinism Tests** | Verifies batch-invariance (same output regardless of batch size) |
+| **RMSNorm** | Normalization layer performance |
+| **Matmul 512x512** | Small matrix multiplication |
+| **Matmul 2048x2048 (FP32)** | Large matrix multiplication (32-bit) |
+| **Matmul 2048x2048 (FP16)** | Large matrix multiplication (16-bit) |
+
+### Interpreting Results
+
+```
+| Operation | Standard | Metal | Overhead |
+|-----------|----------|-------|----------|
+| Matmul 2K (FP32)  | 1.51ms | 1.91ms | +27% |
+```
+
+- **Standard**: Apple's optimized `mx.matmul()` (non-deterministic)
+- **Metal**: Our custom Metal kernel (bitwise deterministic)
+- **Overhead**: Performance cost for determinism guarantee
+
+**Expected overhead ranges** (M4 Max):
+- RMSNorm: +5-10%
+- Matmul 512x512: +30-35%
+- Matmul 2048x2048 (FP32): +27-28%
+- Matmul 2048x2048 (FP16): +30-31%
+
+Results will vary by hardware - use `--extended` mode on your system for accurate numbers.
 
 ## 📈 Performance
 
@@ -158,9 +231,9 @@ We provide two approaches with fundamentally different trade-offs:
 
 | Approach | How It Works | Tolerance | Large Matmul Overhead |
 |----------|--------------|-----------|----------------------|
-| **Python wrapper** | Wraps `mx.matmul()` with tiled reduction | ~1e-5 | +8-20% |
-| **Metal kernel (FP32)** | Custom GPU kernel from scratch | **0.0 (bitwise)** | **+9%** |
-| **Metal kernel (FP16)** | Half-precision GPU kernel | **0.0 (bitwise)** | **+25%** |
+| **Python wrapper** | Wraps `mx.matmul()` with tiled reduction | ~1e-5 | +27-32% |
+| **Metal kernel (FP32)** | Custom GPU kernel from scratch | **0.0 (bitwise)** | **+27-28%** |
+| **Metal kernel (FP16)** | Half-precision GPU kernel | **0.0 (bitwise)** | **+30-31%** |
 
 #### Why the overhead for Metal kernels?
 
@@ -180,12 +253,12 @@ Our custom kernel uses 64x64 tiled matmul with `simdgroup_matrix` hardware-accel
 
 | Operation | Standard MLX | Python Wrapper | Metal Kernel |
 |-----------|--------------|----------------|--------------|
-| RMSNorm   | 0.28ms | 0.34ms (+20%) | **0.29ms (+3%)** |
-| Matmul 512x512 | 0.32ms | 0.35ms (+9%) | 0.36ms (+13%) |
-| Matmul 2048x2048 (FP32) | 2.01ms | 3.25ms (+62%) | **2.19ms (+9%)** |
-| Matmul 2048x2048 (FP16) | 1.56ms | N/A | **1.96ms (+25%)** |
+| RMSNorm   | 0.10ms | 0.11ms (+7%) | **0.11ms (+7%)** |
+| Matmul 512x512 | 0.13ms | 0.17ms (+32%) | **0.17ms (+32%)** |
+| Matmul 2048x2048 (FP32) | 1.50ms | 1.90ms (+27%) | **1.90ms (+27%)** |
+| Matmul 2048x2048 (FP16) | 1.36ms | N/A | **1.78ms (+31%)** |
 
-*Benchmarked on Apple M4 Max. Run `PYTHONPATH=. python mlx_deterministic/benchmarks/benchmark_determinism.py` to reproduce.*
+*Benchmarked on Apple M4 Max using `--extended` mode for thermal-aware testing. Run `PYTHONPATH=. python mlx_deterministic/benchmarks/benchmark_determinism.py --extended` for stable results.*
 
 ### Recommendations
 
@@ -196,7 +269,7 @@ Our custom kernel uses 64x64 tiled matmul with `simdgroup_matrix` hardware-accel
 | **Testing/CI** | Python Wrapper | ~1e-5 tolerance usually sufficient |
 | **Memory-constrained inference** | Metal Kernel (FP16) | Half the memory with bitwise determinism |
 | **Maximum performance** | Python Wrapper | Lowest overhead for large matmul |
-| **RMSNorm/Softmax** | Metal Kernel | Only +3-5% overhead with bitwise determinism |
+| **RMSNorm/Softmax** | Metal Kernel | ~+5-10% overhead with bitwise determinism |
 
 ### Determinism Guarantees
 
