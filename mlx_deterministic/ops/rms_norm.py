@@ -3,6 +3,12 @@ Batch-Invariant RMS Normalization for MLX
 
 This module implements RMSNorm with batch-invariant variance computation,
 ensuring deterministic outputs regardless of batch size.
+
+Based on Thinking Machines Labs research:
+https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/
+
+Research approach: Data-parallel processing where each sample's reduction
+is computed atomically, avoiding any batch-dependent reduction patterns.
 """
 
 import mlx.core as mx
@@ -15,77 +21,48 @@ class BatchInvariantRMSNorm(nn.Module):
     Batch-invariant Root Mean Square Layer Normalization.
 
     This implementation ensures that the output for a given sample is identical
-    regardless of the batch size it's processed in. This is achieved by using
-    fixed-size chunks for variance computation.
+    regardless of the batch size it's processed in.
+
+    Research-aligned approach: Each sample's mean(x²) is computed as a single
+    atomic reduction over all features. This matches the TML research's
+    "data-parallel" approach where "one batch element per core, keeping entire
+    reduction within single core."
 
     Args:
         dims (int): The feature dimension to normalize over (last dimension)
         eps (float): A small constant for numerical stability
-        chunk_size (int): Fixed chunk size for variance computation.
-                         Must be power of 2. Default: 64
+        chunk_size (int): DEPRECATED - kept for API compatibility, ignored internally.
+                         The research-aligned implementation uses atomic per-sample
+                         reduction instead of chunking.
+        use_metal_kernel (bool): If True, use custom Metal kernel for bitwise-identical
+                                determinism. Default: False
     """
 
-    def __init__(self, dims: int, eps: float = 1e-6, chunk_size: int = 64):
+    def __init__(
+        self,
+        dims: int,
+        eps: float = 1e-6,
+        chunk_size: int = 64,
+        use_metal_kernel: bool = False
+    ):
         super().__init__()
         self.dims = dims
         self.eps = eps
-        self.chunk_size = chunk_size
+        self.chunk_size = chunk_size  # Kept for API compatibility, not used
+        self.use_metal_kernel = use_metal_kernel
 
         # Learnable scale parameter
         self.weight = mx.ones((dims,))
 
-        # Verify chunk_size is power of 2
-        assert chunk_size > 0 and (chunk_size & (chunk_size - 1)) == 0, \
-            "chunk_size must be a power of 2"
-
-    def _compute_variance_batch_invariant(self, x: mx.array) -> mx.array:
-        """
-        Compute variance using fixed-size chunks for batch invariance.
-
-        RMSNorm computes variance PER SAMPLE across the feature dimension.
-        Batch invariance is achieved by using a fixed reduction pattern when
-        computing mean(x^2) across features, regardless of batch size.
-
-        The strategy:
-        1. Pad feature dimension to multiple of chunk_size
-        2. Compute chunk-wise means across features
-        3. Average chunks with fixed pattern
-
-        Args:
-            x: Input tensor of shape (..., dims)
-
-        Returns:
-            Mean squared value per sample (same shape as input without last dim)
-        """
-        # Compute squared values
-        x_squared = x * x  # Shape: (..., dims)
-
-        # Pad last dimension (features) to multiple of chunk_size
-        pad_size = (self.chunk_size - (self.dims % self.chunk_size)) % self.chunk_size
-        if pad_size > 0:
-            # Pad along last dimension
-            pad_shape = list(x_squared.shape)
-            pad_shape[-1] = pad_size
-            padding = mx.zeros(pad_shape, dtype=x_squared.dtype)
-            x_squared_padded = mx.concatenate([x_squared, padding], axis=-1)
-        else:
-            x_squared_padded = x_squared
-
-        # Reshape to chunk features: (..., num_chunks, chunk_size)
-        new_shape = list(x_squared_padded.shape[:-1]) + [-1, self.chunk_size]
-        x_chunked = x_squared_padded.reshape(new_shape)
-
-        # Compute mean within each chunk across chunk_size dimension
-        chunk_means = mx.mean(x_chunked, axis=-1)  # Shape: (..., num_chunks)
-
-        # Average across chunks to get final variance
-        variance = mx.mean(chunk_means, axis=-1, keepdims=True)  # Shape: (..., 1)
-
-        return variance
-
     def __call__(self, x: mx.array) -> mx.array:
         """
         Apply batch-invariant RMS normalization.
+
+        Research-aligned: Each sample's mean(x²) is computed as a single atomic
+        reduction. No chunking or padding is used, ensuring:
+        1. Mathematically correct variance for ANY dims value
+        2. Identical reduction pattern regardless of batch size
+        3. No padding-related numerical errors
 
         Args:
             x: Input tensor of shape (..., dims)
@@ -93,15 +70,37 @@ class BatchInvariantRMSNorm(nn.Module):
         Returns:
             Normalized tensor of same shape as input
         """
-        # Compute batch-invariant mean squared value
-        mean_sq = self._compute_variance_batch_invariant(x)  # Shape: (..., 1)
+        # Use Metal kernel for bitwise determinism if requested
+        if self.use_metal_kernel:
+            from .metal_rms_norm import rms_norm_metal
+            return rms_norm_metal(x, self.weight, self.eps)
 
-        # Compute RMS normalization: x / sqrt(mean_sq + eps) * weight
+        # Store original dtype and shape for restoration
+        original_dtype = x.dtype
+        original_shape = x.shape
+
+        # Upcast to float32 for numerical stability (avoids overflow in float16)
+        x = x.astype(mx.float32)
+
+        # Flatten to [batch, dims] for consistent processing
+        x_flat = x.reshape(-1, self.dims)
+
+        # Compute mean squared value per sample (atomic reduction along features)
+        # This is the key to batch invariance: each sample's reduction is independent
+        x_squared = x_flat * x_flat
+        mean_sq = mx.mean(x_squared, axis=-1, keepdims=True)  # [batch, 1]
+
+        # Compute RMS normalization: x / sqrt(mean_sq + eps)
         rms = mx.sqrt(mean_sq + self.eps)
-        normalized = x / rms
+        normalized = x_flat / rms
 
-        # Apply learned weight
-        return normalized * self.weight
+        # Apply learned weight (upcast weight to float32 for consistency)
+        weight = self.weight.astype(mx.float32)
+        result = normalized * weight
+
+        # Restore original shape and dtype
+        result = result.reshape(original_shape)
+        return result.astype(original_dtype)
 
 
 def rms_norm_batch_invariant(
@@ -113,42 +112,37 @@ def rms_norm_batch_invariant(
     """
     Functional batch-invariant RMS normalization.
 
+    Research-aligned: Uses atomic per-sample reduction instead of chunking.
+
     Args:
         x: Input tensor of shape (..., dims)
         weight: Scale parameters of shape (dims,)
         eps: Small constant for numerical stability
-        chunk_size: Fixed chunk size for variance computation
+        chunk_size: DEPRECATED - kept for API compatibility, ignored internally
 
     Returns:
         Normalized tensor of same shape as input
     """
     dims = x.shape[-1]
+    original_dtype = x.dtype
+    original_shape = x.shape
 
-    # Compute squared values
-    x_squared = x * x
+    # Upcast to float32 for numerical stability (avoids overflow in float16)
+    x = x.astype(mx.float32)
 
-    # Pad last dimension (features) to multiple of chunk_size
-    pad_size = (chunk_size - (dims % chunk_size)) % chunk_size
-    if pad_size > 0:
-        pad_shape = list(x_squared.shape)
-        pad_shape[-1] = pad_size
-        padding = mx.zeros(pad_shape, dtype=x_squared.dtype)
-        x_squared_padded = mx.concatenate([x_squared, padding], axis=-1)
-    else:
-        x_squared_padded = x_squared
+    # Flatten to [batch, dims] for consistent processing
+    x_flat = x.reshape(-1, dims)
 
-    # Reshape to chunk features: (..., num_chunks, chunk_size)
-    new_shape = list(x_squared_padded.shape[:-1]) + [-1, chunk_size]
-    x_chunked = x_squared_padded.reshape(new_shape)
-
-    # Compute mean within each chunk
-    chunk_means = mx.mean(x_chunked, axis=-1)
-
-    # Average across chunks to get final mean squared
-    mean_sq = mx.mean(chunk_means, axis=-1, keepdims=True)
+    # Compute mean squared value per sample (atomic reduction)
+    x_squared = x_flat * x_flat
+    mean_sq = mx.mean(x_squared, axis=-1, keepdims=True)
 
     # Apply RMS normalization
     rms = mx.sqrt(mean_sq + eps)
-    normalized = x / rms
+    normalized = x_flat / rms
 
-    return normalized * weight
+    # Apply weight (upcast to float32) and restore shape
+    weight = weight.astype(mx.float32)
+    result = normalized * weight
+    result = result.reshape(original_shape)
+    return result.astype(original_dtype)

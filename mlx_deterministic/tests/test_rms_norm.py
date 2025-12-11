@@ -264,6 +264,85 @@ def test_edge_case_batch_smaller_than_chunk():
     assert max_diff == 0.0, f"Batch size < chunk size failed: diff = {max_diff}"
 
 
+def test_non_divisible_dims_vs_standard():
+    """
+    Test: When dims is NOT divisible by chunk_size, variance must still be correct.
+
+    This catches the padding bug where mean(chunk_means) gives wrong result:
+    - dims=100, chunk_size=64 pads to 128
+    - Bug: computes sum(x²)/128 instead of sum(x²)/100
+    - This underestimates variance by factor dims/padded_dims
+    """
+    # Use dims that is NOT divisible by chunk_size
+    dims = 100  # 100 % 64 = 36, will pad to 128
+    chunk_size = 64
+    eps = 1e-6
+
+    mx.random.seed(42)
+    x = mx.random.normal((1, dims))
+
+    # Batch-invariant RMSNorm
+    bi_model = BatchInvariantRMSNorm(dims, eps=eps, chunk_size=chunk_size)
+    bi_output = bi_model(x)
+
+    # Standard MLX RMSNorm (known correct)
+    std_model = nn.RMSNorm(dims, eps=eps)
+    std_model.weight = bi_model.weight
+    std_output = std_model(x)
+
+    # Compare - should be very close
+    diff = mx.abs(bi_output - std_output)
+    max_diff = mx.max(diff).item()
+
+    # With the padding bug, max_diff would be ~0.1-0.3 (significant)
+    # Correct implementation should have max_diff < 1e-5
+    assert max_diff < 1e-4, (
+        f"Non-divisible dims: max difference {max_diff} too large. "
+        f"This indicates the padding variance bug."
+    )
+
+
+def test_non_divisible_dims_variance_correctness():
+    """
+    Verify that variance computation is correct for non-divisible dims.
+
+    For RMSNorm: rms = sqrt(mean(x²))
+    We verify the output matches what we'd get with correct variance.
+
+    Note: The new atomic per-sample implementation computes variance correctly
+    by design (simple mx.mean(x*x)), so this test validates the end-to-end
+    output rather than an internal method.
+    """
+    dims = 100  # Not divisible by 64
+    chunk_size = 64
+    eps = 1e-6
+
+    mx.random.seed(123)
+    x = mx.random.normal((8, dims))
+
+    # Compute expected output manually using correct variance
+    # RMSNorm: output = x / sqrt(mean(x²) + eps) * weight
+    true_mean_sq = mx.mean(x * x, axis=-1, keepdims=True)
+    true_rms = mx.sqrt(true_mean_sq + eps)
+    weight = mx.ones((dims,))
+    expected_output = (x / true_rms) * weight
+
+    # Compute our batch-invariant version's output
+    model = BatchInvariantRMSNorm(dims, eps=eps, chunk_size=chunk_size)
+    actual_output = model(x)
+
+    # These should match exactly (both use atomic mean computation)
+    diff = mx.abs(expected_output - actual_output)
+    max_diff = mx.max(diff).item()
+
+    # With the old padding bug: output would differ significantly
+    # Correct implementation should have exact match (or very small FP diff)
+    assert max_diff < 1e-6, (
+        f"Output incorrect for non-divisible dims. "
+        f"Max diff: {max_diff}. Expected < 1e-6."
+    )
+
+
 if __name__ == "__main__":
     # Run all tests
     test_batch_invariance_basic()

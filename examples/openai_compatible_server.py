@@ -19,9 +19,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
-import mlx.core as mx
 from mlx_lm import load, generate
-import mlx.nn as nn
 import uvicorn
 import time
 import sys
@@ -30,7 +28,7 @@ import os
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from mlx_deterministic.ops import BatchInvariantRMSNorm, BatchInvariantAttention
+from mlx_deterministic import enable_mlx_lm_deterministic_mode
 
 app = FastAPI(title="MLX Deterministic Inference API")
 
@@ -98,83 +96,16 @@ class ModelsResponse(BaseModel):
 # ============================================================================
 
 def enable_deterministic_mode(model):
-    """Enable deterministic inference by replacing operations."""
+    """Enable deterministic inference by monkey-patching MLX-LM attention."""
     global DETERMINISTIC_ENABLED
 
     if DETERMINISTIC_ENABLED:
         return
 
     print("🔧 Enabling deterministic mode...")
-    replaced_count = 0
-
-    # Get the actual model (MLX-LM wraps it)
-    actual_model = model.model if hasattr(model, 'model') else model
-
-    # Walk through all layers
-    def replace_in_module(module, path=""):
-        nonlocal replaced_count
-
-        for name in dir(module):
-            if name.startswith('_'):
-                continue
-
-            try:
-                child = getattr(module, name)
-                if not isinstance(child, nn.Module):
-                    continue
-
-                # Replace RMSNorm
-                if isinstance(child, nn.RMSNorm) and not isinstance(child, BatchInvariantRMSNorm):
-                    new_norm = BatchInvariantRMSNorm(
-                        dims=child.dims,
-                        eps=child.eps,
-                        chunk_size=64
-                    )
-                    new_norm.weight = child.weight
-                    setattr(module, name, new_norm)
-                    replaced_count += 1
-                    print(f"  ✓ Replaced {path}.{name}")
-
-                # Replace MultiHeadAttention
-                elif isinstance(child, nn.MultiHeadAttention) and not isinstance(child, BatchInvariantAttention):
-                    new_attn = BatchInvariantAttention(
-                        dims=child.dims,
-                        num_heads=child.num_heads,
-                        query_input_dims=child.query_input_dims,
-                        key_input_dims=child.key_input_dims,
-                        value_dims=child.value_dims,
-                        value_output_dims=child.value_output_dims,
-                        bias=child.query_proj.bias is not None,
-                        matmul_tile_size=128,
-                        softmax_chunk_size=128,
-                    )
-                    # Copy weights
-                    new_attn.query_proj.weight = child.query_proj.weight
-                    new_attn.key_proj.weight = child.key_proj.weight
-                    new_attn.value_proj.weight = child.value_proj.weight
-                    new_attn.out_proj.weight = child.out_proj.weight
-                    if child.query_proj.bias is not None:
-                        new_attn.query_proj.bias = child.query_proj.bias
-                        new_attn.key_proj.bias = child.key_proj.bias
-                        new_attn.value_proj.bias = child.value_proj.bias
-                        new_attn.out_proj.bias = child.out_proj.bias
-                    setattr(module, name, new_attn)
-                    replaced_count += 1
-                    print(f"  ✓ Replaced {path}.{name}")
-
-                # Recursively process children
-                elif hasattr(child, '__dict__'):
-                    new_path = f"{path}.{name}" if path else name
-                    replace_in_module(child, new_path)
-
-            except Exception as e:
-                # Skip attributes that can't be accessed
-                pass
-
-    replace_in_module(actual_model)
-
+    # Use the new MLX-LM specific function that patches scaled_dot_product_attention
+    enable_mlx_lm_deterministic_mode(split_size=256)
     DETERMINISTIC_ENABLED = True
-    print(f"✓ Deterministic mode enabled ({replaced_count} operations replaced)")
 
 # ============================================================================
 # API Endpoints

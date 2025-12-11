@@ -3,6 +3,13 @@ Batch-Invariant Attention for MLX
 
 This module implements attention mechanisms with batch-invariant operations,
 ensuring deterministic outputs regardless of batch size.
+
+Based on Thinking Machines Labs research:
+https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/
+
+Research approach: FlashAttention-style with FIXED SPLIT-SIZE (not fixed number
+of splits). This ensures the reduction pattern is independent of batch/sequence
+length variations.
 """
 
 import mlx.core as mx
@@ -11,103 +18,173 @@ from typing import Optional, Tuple
 import math
 
 
+def flash_attention_fixed_split(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    scale: float,
+    split_size: int = 256,
+    mask: Optional[mx.array] = None,
+) -> mx.array:
+    """
+    FlashAttention with FIXED SPLIT-SIZE for batch invariance.
+
+    Research-aligned approach: Use fixed split_size, not fixed number of splits.
+    This ensures identical reduction patterns regardless of sequence length.
+
+    Supports Grouped Query Attention (GQA) where n_kv_heads < n_heads.
+
+    Key insight from TML research:
+    - Old approach: KV_len=1000, 4 splits → 250 elements each (varies with KV_len)
+    - New approach: KV_len=1000, split_size=256 → 4 full + 1 partial (fixed pattern)
+
+    The online softmax algorithm processes KV in fixed-size blocks, accumulating
+    results with numerically stable rescaling.
+
+    Args:
+        q: Query tensor [B, H_q, N, D] or [H_q, N, D]
+        k: Key tensor [B, H_kv, S, D] or [H_kv, S, D] (H_kv may differ from H_q for GQA)
+        v: Value tensor [B, H_kv, S, D] or [H_kv, S, D]
+        scale: Attention scale factor (typically 1/sqrt(head_dim))
+        split_size: Fixed size for KV splits (default: 256)
+        mask: Optional attention mask [N, S] or broadcastable
+
+    Returns:
+        Attention output with same shape as q
+    """
+    # Handle the case where input is unbatched
+    original_shape = q.shape
+    if len(q.shape) == 3:
+        # Add batch dimension
+        q = q[None, ...]
+        k = k[None, ...]
+        v = v[None, ...]
+        if mask is not None and len(mask.shape) < 4:
+            mask = mask[None, ...]
+
+    B, H_q, N, D = q.shape
+    _, H_kv, S, _ = k.shape
+
+    # Handle Grouped Query Attention (GQA) by repeating KV heads
+    if H_kv != H_q:
+        # Number of query heads per KV head
+        n_rep = H_q // H_kv
+        # Repeat K and V: [B, H_kv, S, D] -> [B, H_q, S, D]
+        k = mx.repeat(k, n_rep, axis=1)
+        v = mx.repeat(v, n_rep, axis=1)
+
+    # Initialize online softmax accumulators
+    # m_i: running maximum (for numerical stability)
+    # l_i: running sum of exp(x - max)
+    # o_i: running weighted sum
+    m_i = mx.full((B, H_q, N, 1), -1e9, dtype=q.dtype)
+    l_i = mx.zeros((B, H_q, N, 1), dtype=q.dtype)
+    o_i = mx.zeros((B, H_q, N, D), dtype=q.dtype)
+
+    # Fixed number of blocks based on split_size
+    num_blocks = (S + split_size - 1) // split_size
+
+    for j in range(num_blocks):
+        start = j * split_size
+        end = min(start + split_size, S)
+
+        # Extract KV block
+        k_j = k[:, :, start:end, :]  # [B, H_q, block_len, D]
+        v_j = v[:, :, start:end, :]  # [B, H_q, block_len, D]
+
+        # Compute attention scores for this block: Q @ K_j^T
+        # q: [B, H_q, N, D], k_j: [B, H_q, block_len, D]
+        s_ij = (q @ k_j.swapaxes(-1, -2)) * scale  # [B, H_q, N, block_len]
+
+        # Apply mask if provided
+        if mask is not None:
+            if mask.shape[-1] > end:
+                mask_block = mask[..., start:end]
+            else:
+                mask_block = mask
+            s_ij = s_ij + mask_block
+
+        # Online softmax update (numerically stable)
+        # Find max in this block
+        m_ij = mx.max(s_ij, axis=-1, keepdims=True)  # [B, H_q, N, 1]
+
+        # New running max
+        m_new = mx.maximum(m_i, m_ij)
+
+        # Rescale factors
+        alpha = mx.exp(m_i - m_new)  # Rescale old accumulator
+        beta = mx.exp(s_ij - m_new)  # New block contributions
+
+        # Update running sum
+        l_new = alpha * l_i + mx.sum(beta, axis=-1, keepdims=True)
+
+        # Update output accumulator
+        # o_i = alpha * o_i + beta @ v_j
+        o_i = alpha * o_i + (beta @ v_j)
+
+        # Update running values
+        m_i = m_new
+        l_i = l_new
+
+    # Final normalization
+    result = o_i / l_i
+
+    # Remove batch dimension if input was unbatched
+    if len(original_shape) == 3:
+        result = result[0]
+
+    return result
+
+
 def batch_invariant_softmax(
     x: mx.array,
     axis: int = -1,
-    chunk_size: int = 128
+    chunk_size: int = 128,
+    use_metal_kernel: bool = False
 ) -> mx.array:
     """
-    Batch-invariant softmax with fixed reduction pattern.
+    Batch-invariant softmax using atomic per-row reduction.
 
-    Standard softmax: exp(x - max(x)) / sum(exp(x - max(x)))
-    The max and sum reductions must use fixed patterns for batch invariance.
+    Research-aligned: Each row's softmax is computed independently with
+    a single max and sum reduction, ensuring batch invariance.
 
     Args:
         x: Input tensor
-        axis: Axis along which to compute softmax
-        chunk_size: Fixed chunk size for reductions
+        axis: Axis along which to compute softmax (must be -1)
+        chunk_size: DEPRECATED - kept for API compatibility
+        use_metal_kernel: If True, use custom Metal kernel for bitwise-identical
+                         determinism. Default: False
 
     Returns:
         Softmax probabilities
     """
-    # For batch invariance, we need fixed reduction trees for both max and sum
-    # We'll use chunked reductions similar to RMSNorm
-
-    # Get the dimension size along the reduction axis
-    dim_size = x.shape[axis]
-
-    # Pad to multiple of chunk_size
-    pad_size = (chunk_size - (dim_size % chunk_size)) % chunk_size
-
-    if pad_size > 0:
-        # Create padding shape
-        pad_shape = list(x.shape)
-        pad_shape[axis] = pad_size
-
-        # Pad with -inf for max computation (won't affect result)
-        padding = mx.full(pad_shape, -float('inf'), dtype=x.dtype)
-
-        # Concatenate along the reduction axis
-        if axis == -1:
-            x_padded = mx.concatenate([x, padding], axis=-1)
-        else:
-            # Handle other axes if needed
-            x_padded = mx.concatenate([x, padding], axis=axis)
-    else:
-        x_padded = x
-
-    # Reshape to create chunks: move reduction axis to second-to-last position
-    # and create chunk dimension
-    if axis == -1:
-        # Shape: (..., dim_padded) -> (..., num_chunks, chunk_size)
-        new_shape = list(x_padded.shape[:-1]) + [-1, chunk_size]
-        x_chunked = x_padded.reshape(new_shape)
-
-        # Find max within each chunk
-        chunk_max = mx.max(x_chunked, axis=-1, keepdims=True)  # (..., num_chunks, 1)
-
-        # Find global max across chunks
-        global_max = mx.max(chunk_max, axis=-2, keepdims=True)  # (..., 1, 1)
-
-        # Subtract max for numerical stability
-        x_shifted = x - mx.squeeze(global_max, axis=(-2, -1))[..., None]
-
-        # Compute exp
-        exp_x = mx.exp(x_shifted)
-
-        # Pad exp_x same way
-        if pad_size > 0:
-            padding_exp = mx.zeros(pad_shape, dtype=exp_x.dtype)
-            exp_x_padded = mx.concatenate([exp_x, padding_exp], axis=-1)
-        else:
-            exp_x_padded = exp_x
-
-        # Reshape to chunks
-        exp_x_chunked = exp_x_padded.reshape(new_shape)
-
-        # Sum within each chunk
-        chunk_sum = mx.sum(exp_x_chunked, axis=-1, keepdims=True)  # (..., num_chunks, 1)
-
-        # Global sum across chunks
-        global_sum = mx.sum(chunk_sum, axis=-2, keepdims=True)  # (..., 1, 1)
-
-        # Compute softmax
-        result = exp_x / mx.squeeze(global_sum, axis=(-2, -1))[..., None]
-
-        return result
-
-    else:
-        # For simplicity, only support last axis for now
+    if axis != -1:
         raise NotImplementedError("Only axis=-1 is currently supported")
+
+    # Use Metal kernel for bitwise determinism if requested
+    if use_metal_kernel:
+        from .metal_softmax import softmax_metal
+        return softmax_metal(x, axis=axis)
+
+    # Simple atomic softmax per row - no chunking needed
+    # Each row's max and sum are computed independently
+    x_max = mx.max(x, axis=-1, keepdims=True)
+    x_shifted = x - x_max
+    exp_x = mx.exp(x_shifted)
+    sum_exp = mx.sum(exp_x, axis=-1, keepdims=True)
+
+    return exp_x / sum_exp
 
 
 class BatchInvariantAttention(nn.Module):
     """
-    Batch-invariant multi-head attention.
+    Batch-invariant multi-head attention using FlashAttention algorithm.
 
-    Implements scaled dot-product attention with batch-invariant operations:
-    - Batch-invariant matmul for Q@K^T and attention@V
-    - Batch-invariant softmax for attention weights
+    Research-aligned approach: Uses FlashAttention with fixed split-size
+    instead of naive O(n²) attention. This ensures:
+    1. Memory efficient: O(N) instead of O(N²) for attention matrix
+    2. Deterministic: Fixed split pattern regardless of batch/sequence length
+    3. Numerically stable: Online softmax with running max
 
     Args:
         dims (int): Model dimension
@@ -117,8 +194,8 @@ class BatchInvariantAttention(nn.Module):
         value_dims (Optional[int]): Value dimension (defaults to dims)
         value_output_dims (Optional[int]): Output dimension (defaults to dims)
         bias (bool): Whether to use bias in projections
-        matmul_tile_size (int): Tile size for batch-invariant matmul
-        softmax_chunk_size (int): Chunk size for batch-invariant softmax
+        matmul_tile_size (int): DEPRECATED - kept for API compatibility
+        softmax_chunk_size (int): Now used as KV split_size for FlashAttention
     """
 
     def __init__(
@@ -140,15 +217,20 @@ class BatchInvariantAttention(nn.Module):
         value_dims = value_dims or dims
         value_output_dims = value_output_dims or dims
 
+        self.dims = dims
         self.num_heads = num_heads
+        self.head_dim = dims // num_heads
+
+        # Repurpose softmax_chunk_size as split_size for FlashAttention
+        self.split_size = softmax_chunk_size
+
+        # Keep for API compatibility (not used in FlashAttention path)
         self.matmul_tile_size = matmul_tile_size
         self.softmax_chunk_size = softmax_chunk_size
 
-        head_dim = dims // num_heads
-        self.scale = head_dim ** -0.5
+        self.scale = self.head_dim ** -0.5
 
-        # Projection layers (using standard MLX layers for now)
-        # In full integration, these would use batch-invariant matmul
+        # Projection layers
         self.query_proj = nn.Linear(query_input_dims, dims, bias=bias)
         self.key_proj = nn.Linear(key_input_dims, dims, bias=bias)
         self.value_proj = nn.Linear(key_input_dims, value_dims, bias=bias)
@@ -163,7 +245,7 @@ class BatchInvariantAttention(nn.Module):
         cache: Optional[Tuple[mx.array, mx.array]] = None,
     ) -> mx.array:
         """
-        Apply batch-invariant multi-head attention.
+        Apply batch-invariant multi-head attention using FlashAttention.
 
         Args:
             queries: Query tensor [..., seq_len, dims]
@@ -175,9 +257,6 @@ class BatchInvariantAttention(nn.Module):
         Returns:
             Attention output [..., seq_len, dims]
         """
-        # Import here to avoid circular dependency
-        from .matmul import batch_invariant_matmul
-
         # Project queries, keys, values
         queries = self.query_proj(queries)
         keys = self.key_proj(keys)
@@ -191,55 +270,43 @@ class BatchInvariantAttention(nn.Module):
 
         # Get dimensions
         *batch_dims, seq_len, dims = queries.shape
-        _, kv_seq_len, _ = keys.shape
-        head_dim = dims // self.num_heads
+        kv_seq_len = keys.shape[-2]
 
         # Reshape for multi-head attention
         # [..., seq_len, dims] -> [..., seq_len, num_heads, head_dim]
-        queries = queries.reshape(*batch_dims, seq_len, self.num_heads, head_dim)
-        keys = keys.reshape(*batch_dims, kv_seq_len, self.num_heads, head_dim)
-        values = values.reshape(*batch_dims, kv_seq_len, self.num_heads, head_dim)
+        queries = queries.reshape(*batch_dims, seq_len, self.num_heads, self.head_dim)
+        keys = keys.reshape(*batch_dims, kv_seq_len, self.num_heads, self.head_dim)
+        values = values.reshape(*batch_dims, kv_seq_len, self.num_heads, self.head_dim)
 
         # Transpose to [..., num_heads, seq_len, head_dim]
-        queries = queries.transpose(0, 2, 1, 3) if len(batch_dims) == 1 else \
-                  queries.transpose(*range(len(batch_dims)), -2, -3, -1)
-        keys = keys.transpose(0, 2, 1, 3) if len(batch_dims) == 1 else \
-               keys.transpose(*range(len(batch_dims)), -2, -3, -1)
-        values = values.transpose(0, 2, 1, 3) if len(batch_dims) == 1 else \
-                 values.transpose(*range(len(batch_dims)), -2, -3, -1)
+        if len(batch_dims) == 1:
+            queries = queries.transpose(0, 2, 1, 3)
+            keys = keys.transpose(0, 2, 1, 3)
+            values = values.transpose(0, 2, 1, 3)
+        else:
+            # Handle unbatched case
+            queries = queries.transpose(-3, -2)
+            keys = keys.transpose(-3, -2)
+            values = values.transpose(-3, -2)
+            # Swap to get [num_heads, seq, head_dim]
+            queries = queries.swapaxes(-3, -2)
+            keys = keys.swapaxes(-3, -2)
+            values = values.swapaxes(-3, -2)
 
-        # Compute attention scores: Q @ K^T
-        # Need to transpose keys: [..., num_heads, head_dim, kv_seq_len]
-        keys_t = keys.transpose(*range(len(keys.shape) - 2), -1, -2)
-
-        # Batch-invariant matmul for attention scores
-        scores = batch_invariant_matmul(
-            queries, keys_t, tile_size=self.matmul_tile_size
-        )  # [..., num_heads, seq_len, kv_seq_len]
-
-        # Scale scores
-        scores = scores * self.scale
-
-        # Apply mask if provided
-        if mask is not None:
-            scores = scores + mask
-
-        # Batch-invariant softmax
-        # For attention, we apply softmax over the key sequence dimension (last dim)
-        attn_weights = batch_invariant_softmax(
-            scores, axis=-1, chunk_size=self.softmax_chunk_size
+        # Use FlashAttention with fixed split-size
+        attn_output = flash_attention_fixed_split(
+            queries, keys, values,
+            scale=self.scale,
+            split_size=self.split_size,
+            mask=mask
         )
 
-        # Apply attention to values: attn_weights @ V
-        # attn_weights: [..., num_heads, seq_len, kv_seq_len]
-        # values: [..., num_heads, kv_seq_len, head_dim]
-        attn_output = batch_invariant_matmul(
-            attn_weights, values, tile_size=self.matmul_tile_size
-        )  # [..., num_heads, seq_len, head_dim]
-
         # Transpose back: [..., seq_len, num_heads, head_dim]
-        attn_output = attn_output.transpose(0, 2, 1, 3) if len(batch_dims) == 1 else \
-                      attn_output.transpose(*range(len(batch_dims)), -2, -3, -1)
+        if len(batch_dims) == 1:
+            attn_output = attn_output.transpose(0, 2, 1, 3)
+        else:
+            attn_output = attn_output.swapaxes(-3, -2)
+            attn_output = attn_output.transpose(-3, -2)
 
         # Reshape to [..., seq_len, dims]
         attn_output = attn_output.reshape(*batch_dims, seq_len, dims)
@@ -248,6 +315,77 @@ class BatchInvariantAttention(nn.Module):
         output = self.out_proj(attn_output)
 
         return output
+
+
+def scaled_dot_product_attention_deterministic(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    cache,
+    scale: float,
+    mask,
+    sinks=None,
+    split_size: int = 256,
+) -> mx.array:
+    """
+    Batch-invariant replacement for mlx_lm.models.base.scaled_dot_product_attention.
+
+    This function is designed to be a drop-in replacement that uses
+    flash_attention_fixed_split for deterministic attention computation.
+
+    Args:
+        queries: Query tensor [B, H, N, D]
+        keys: Key tensor [B, H, S, D] or quantized tuple
+        values: Value tensor [B, H, S, D] or quantized tuple
+        cache: KV cache (may have .bits for quantized models)
+        scale: Attention scale factor
+        mask: Attention mask (None, "causal", bool array, or float array)
+        sinks: Attention sinks (not supported, will warn if provided)
+        split_size: KV split size for flash attention
+
+    Returns:
+        Attention output [B, H, N, D]
+    """
+    # Handle quantized cache - pass through to original quantized path
+    if cache is not None and hasattr(cache, "bits"):
+        from mlx_lm.models.base import quantized_scaled_dot_product_attention
+        return quantized_scaled_dot_product_attention(
+            queries, keys, values,
+            scale=scale, mask=mask,
+            group_size=cache.group_size, bits=cache.bits,
+        )
+
+    # Warn about unsupported attention sinks
+    if sinks is not None:
+        import warnings
+        warnings.warn("Attention sinks not supported in deterministic mode, ignoring")
+
+    # Handle string mask ("causal") - convert to additive mask array
+    if isinstance(mask, str) and mask == "causal":
+        N = queries.shape[-2]  # query sequence length
+        S = keys.shape[-2]     # key sequence length
+        # Create indices for causal masking
+        q_indices = mx.arange(S - N, S)[:, None]  # [N, 1]
+        k_indices = mx.arange(S)[None, :]          # [1, S]
+        # Causal: query i can attend to keys <= i
+        causal_mask = q_indices >= k_indices       # [N, S] bool
+        # Convert to additive mask (0 for attend, -inf for masked)
+        mask = mx.where(causal_mask,
+                       mx.zeros((N, S), dtype=queries.dtype),
+                       mx.full((N, S), -1e9, dtype=queries.dtype))
+    elif mask is not None and hasattr(mask, 'dtype') and mask.dtype == mx.bool_:
+        # Convert bool mask to additive mask
+        mask = mx.where(mask,
+                       mx.zeros(mask.shape, dtype=queries.dtype),
+                       mx.full(mask.shape, -1e9, dtype=queries.dtype))
+
+    # Use our batch-invariant flash attention
+    return flash_attention_fixed_split(
+        queries, keys, values,
+        scale=scale,
+        split_size=split_size,
+        mask=mask,
+    )
 
 
 def create_causal_mask(seq_len: int, kv_seq_len: Optional[int] = None) -> mx.array:
