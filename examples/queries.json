@@ -1,5 +1,9 @@
 [
   {
+    "name": "Math completion (divergence-prone)",
+    "query": "The answer to 2+2 is"
+  },
+  {
     "name": "Ounces in a pound",
     "query": "How many ounces in a pound?"
   },

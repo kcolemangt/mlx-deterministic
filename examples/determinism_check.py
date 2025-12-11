@@ -55,8 +55,16 @@ def load_queries(input_path: str) -> list[dict[str, str]]:
     return queries
 
 
-def format_prompt(tokenizer: Any, query: str) -> str:
-    """Format query using the model's chat template if available."""
+def format_prompt(tokenizer: Any, query: str, raw: bool = False) -> str:
+    """Format query using the model's chat template if available.
+
+    Args:
+        tokenizer: The tokenizer
+        query: The input query
+        raw: If True, use query as-is without chat template (for divergence testing)
+    """
+    if raw:
+        return query
     if hasattr(tokenizer, "apply_chat_template"):
         messages = [{"role": "user", "content": query}]
         return tokenizer.apply_chat_template(
@@ -72,6 +80,7 @@ def check_batch_invariance(
     tokenizer: Any,
     query: str,
     batch_sizes: list[int],
+    raw: bool = False,
 ) -> tuple[bool, float, dict[int, float]]:
     """
     Check if model produces identical outputs across different batch sizes.
@@ -79,7 +88,7 @@ def check_batch_invariance(
     Returns:
         (is_deterministic, max_diff, diffs_by_batch_size)
     """
-    prompt = format_prompt(tokenizer, query)
+    prompt = format_prompt(tokenizer, query, raw=raw)
     tokens = tokenizer.encode(prompt)
 
     # Get reference logits at batch_size=1
@@ -114,16 +123,28 @@ def generate_text(
     tokenizer: Any,
     query: str,
     max_tokens: int = 50,
+    batch_size: int = 1,
+    raw: bool = False,
 ) -> str:
-    """Generate text using greedy decoding for reproducibility."""
-    prompt = format_prompt(tokenizer, query)
+    """Generate text using greedy decoding for reproducibility.
+
+    Args:
+        model: The model to use for generation
+        tokenizer: The tokenizer
+        query: The input query
+        max_tokens: Maximum tokens to generate
+        batch_size: Batch size to use (duplicates prompt, uses first output)
+        raw: If True, use query as-is without chat template
+    """
+    prompt = format_prompt(tokenizer, query, raw=raw)
     current_ids = tokenizer.encode(prompt)
     generated_tokens = []
 
     for _ in range(max_tokens):
-        x = mx.array([current_ids])
+        # Use specified batch size (duplicate prompt, take first output)
+        x = mx.array([current_ids] * batch_size)
         out = model(x)
-        next_token_logits = out[0, -1, :]
+        next_token_logits = out[0, -1, :]  # Always use first sample
         next_token = int(mx.argmax(next_token_logits).item())
 
         # Stop at EOS or end-of-turn tokens
@@ -137,6 +158,25 @@ def generate_text(
         current_ids.append(next_token)
 
     return tokenizer.decode(generated_tokens)
+
+
+def generate_text_per_batch_size(
+    model: Any,
+    tokenizer: Any,
+    query: str,
+    batch_sizes: list[int],
+    max_tokens: int = 50,
+    raw: bool = False,
+) -> dict[int, str]:
+    """Generate text for each batch size to compare outputs.
+
+    Returns:
+        Dict mapping batch_size -> generated_text
+    """
+    results = {}
+    for bs in batch_sizes:
+        results[bs] = generate_text(model, tokenizer, query, max_tokens, batch_size=bs, raw=raw)
+    return results
 
 
 def main() -> int:
@@ -187,7 +227,7 @@ Examples:
         "--quick",
         "-q",
         action="store_true",
-        help="Quick mode: test only 1 prompt with batch sizes [1, 4], 15 tokens",
+        help="Quick mode: test only 1 prompt with batch sizes [1, 32], 30 tokens",
     )
     parser.add_argument(
         "--metal",
@@ -199,6 +239,11 @@ Examples:
         action="store_true",
         help="Run without deterministic mode to show baseline variance",
     )
+    parser.add_argument(
+        "--raw",
+        action="store_true",
+        help="Use raw prompts without chat template (shows more divergence)",
+    )
 
     args = parser.parse_args()
 
@@ -208,8 +253,8 @@ Examples:
 
     # Quick mode overrides - minimal for fast iteration
     if args.quick:
-        args.batch_sizes = "1,4"
-        args.max_tokens = 15
+        args.batch_sizes = "1,32"
+        args.max_tokens = 30
 
     # Determine input file path
     if args.input:
@@ -303,7 +348,7 @@ Examples:
 
         # Check batch invariance
         is_det, max_diff, diffs = check_batch_invariance(
-            model, tokenizer, query, batch_sizes
+            model, tokenizer, query, batch_sizes, raw=args.raw
         )
 
         if is_det:
@@ -322,12 +367,33 @@ Examples:
 
         # Generate text for sanity check
         print()
-        print("Generated response:")
-        response = generate_text(model, tokenizer, query, args.max_tokens)
-        # Indent the response
-        for line in response.split("\n"):
-            print(f"  {line}")
-        print()
+        if not is_det and (args.verbose or args.no_determinism):
+            # Show outputs for each batch size when variance detected
+            print("Generated outputs per batch size:")
+            batch_outputs = generate_text_per_batch_size(
+                model, tokenizer, query, batch_sizes, args.max_tokens, raw=args.raw
+            )
+            reference = batch_outputs.get(1, "")
+            for bs in batch_sizes:
+                output = batch_outputs[bs]
+                # Mark if different from batch_size=1
+                marker = ""
+                if bs > 1 and output != reference:
+                    marker = "  <- DIFFERENT"
+                # Show truncated output (collapse newlines)
+                display = output.replace("\n", " ")
+                if len(display) > 70:
+                    display = display[:67] + "..."
+                print(f"  batch_size={bs:3d}: \"{display}\"{marker}")
+            print()
+            response = reference  # Use batch_size=1 for the result
+        else:
+            print("Generated response:")
+            response = generate_text(model, tokenizer, query, args.max_tokens, raw=args.raw)
+            # Indent the response
+            for line in response.split("\n"):
+                print(f"  {line}")
+            print()
 
         results.append(
             {

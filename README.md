@@ -164,12 +164,36 @@ python examples/determinism_check.py --metal --model mlx-community/Qwen3-4B-4bit
 
 # Full test with all batch sizes and verbose output
 python examples/determinism_check.py --metal --verbose --batch-sizes "1,2,4,8,16,32"
-
-# Test WITHOUT deterministic mode (shows baseline variance)
-python examples/determinism_check.py --no-determinism --verbose --quick
 ```
 
-The `--no-determinism` flag runs models without any deterministic modifications, useful for demonstrating why this library exists. Some models (like Qwen3-0.6B) show significant variance (~0.75 logit difference) without deterministic mode.
+#### Demonstrating the Problem
+
+To see actual text divergence caused by batch size variance, use `--raw` mode with `--no-determinism`:
+
+```bash
+# WITHOUT deterministic mode - outputs DIFFER by batch size
+python examples/determinism_check.py --no-determinism --quick --raw --model mlx-community/Qwen3-0.6B-4bit
+```
+
+Output shows different text generated depending on batch size:
+```
+Generated outputs per batch size:
+  batch_size=  1: " 4, but in reality, it's 2+2=4, so the answer is 4..."
+  batch_size= 32: " 4, but in reality, 2+2=4, so the answer is 4..."  <- DIFFERENT
+```
+
+Now verify our Metal kernels fix the issue:
+
+```bash
+# WITH deterministic mode - outputs are IDENTICAL
+python examples/determinism_check.py --metal --quick --raw --model mlx-community/Qwen3-0.6B-4bit
+```
+
+Output shows bitwise-identical results:
+```
+Batch invariance: PASS (all batch sizes produce identical logits)
+All outputs are BITWISE IDENTICAL across batch sizes [1, 32]
+```
 
 See [`examples/MLX_DETERMINISM_NOTES.md`](examples/MLX_DETERMINISM_NOTES.md) for historical context on MLX's batch determinism behavior.
 
