@@ -23,7 +23,7 @@ from typing import Any, Dict, Optional
 
 # Metal kernel for deterministic RMSNorm (optimized for M4 Max)
 # Each threadgroup processes one sample with tree reduction
-# Note: eps is hardcoded since Metal kernels don't support float template args
+# eps is passed as an input array to support configurable epsilon values
 RMSNORM_KERNEL_SOURCE: str = """
 // Each threadgroup handles one sample (one row of input)
 uint sample_idx = threadgroup_position_in_grid.x;
@@ -109,9 +109,8 @@ threadgroup_barrier(mem_flags::mem_threadgroup);
 
 // Now shared_sum[0] contains sum of all x^2 for this sample
 // Compute RMS: sqrt(mean(x^2) + eps)
-// eps = 1e-6 hardcoded
 T mean_sq = shared_sum[0] / T(dims);
-T rms = metal::sqrt(mean_sq + T(1e-6));
+T rms = metal::sqrt(mean_sq + eps[0]);
 T inv_rms = T(1) / rms;  // Pre-compute inverse for faster division
 
 // Each thread normalizes its portion of the output
@@ -143,7 +142,7 @@ def _create_rmsnorm_kernel():
     """Create the Metal kernel for deterministic RMSNorm."""
     return mx.fast.metal_kernel(
         name="deterministic_rmsnorm",
-        input_names=["x", "weight"],
+        input_names=["x", "weight", "eps"],
         output_names=["out"],
         source=RMSNORM_KERNEL_SOURCE,
         ensure_row_contiguous=True,
@@ -193,11 +192,10 @@ def rms_norm_metal(
     grid = (total_threads, 1, 1)
     threadgroup = (num_threads, 1, 1)
 
-    # Execute kernel
-    # Note: eps is hardcoded in the kernel source (1e-6)
-    # This is a limitation of Metal kernels not supporting float template args
+    # Execute kernel with eps passed as input array
+    eps_array = mx.array([eps], dtype=x.dtype)
     outputs = kernel(
-        inputs=[x_flat, weight],
+        inputs=[x_flat, weight, eps_array],
         template=[("T", x.dtype)],
         grid=grid,
         threadgroup=threadgroup,

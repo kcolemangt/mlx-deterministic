@@ -1,6 +1,6 @@
 # MLX Deterministic Inference
 
-[![Tests](https://img.shields.io/badge/tests-62%2F65%20passing-brightgreen)](mlx_deterministic/tests/)
+[![Tests](https://img.shields.io/badge/tests-76%2F79%20passing-brightgreen)](mlx_deterministic/tests/)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org/downloads/)
 [![MLX](https://img.shields.io/badge/MLX-0.29%2B-orange)](https://github.com/ml-explore/mlx)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
@@ -80,7 +80,7 @@ Matmul              ~1e-5 tolerance    0.0 (bitwise)          0.0 (bitwise)
 Softmax             ~1e-5 tolerance    0.0 (bitwise)          N/A
 Attention           <1e-4 tolerance    <1e-4 tolerance        N/A
 
-65 tests (62 passing, 3 xfail for known limitations) across batch sizes [1, 2, 4, 8, 16, 32, 64, 128]
+79 tests (76 passing, 3 xfail for known limitations) across batch sizes [1, 2, 4, 8, 16, 32, 64, 128]
 ```
 
 ## 🚀 Quick Start
@@ -143,7 +143,7 @@ See **[INTEGRATION_GUIDE.md](INTEGRATION_GUIDE.md)** for complete examples.
 ## 🧪 Testing
 
 ```bash
-# Run all tests (62 passing, 3 xfail for known limitations)
+# Run all tests (76 passing, 3 xfail)
 python -m pytest mlx_deterministic/tests/ -v
 
 # Run specific test files
