@@ -6,10 +6,20 @@ A user-friendly tool to verify that MLX deterministic inference produces
 identical outputs regardless of batch size.
 
 Usage:
-    python examples/determinism_check.py
-    python examples/determinism_check.py --input my_queries.json
-    python examples/determinism_check.py --model mlx-community/Qwen2.5-7B-Instruct-4bit
-    python examples/determinism_check.py --max-tokens 100 --verbose
+    # Quick test with Metal kernels (recommended)
+    python examples/determinism_check.py --metal --quick
+
+    # Test WITHOUT deterministic mode (shows baseline variance)
+    python examples/determinism_check.py --no-determinism --verbose --quick
+
+    # Test a specific model
+    python examples/determinism_check.py --metal --model mlx-community/Qwen3-4B-4bit
+
+    # Full test with all batch sizes
+    python examples/determinism_check.py --metal --verbose --batch-sizes "1,2,4,8,16,32"
+
+See MLX_DETERMINISM_NOTES.md in this directory for historical context on MLX's
+batch determinism behavior and why this library exists.
 """
 
 import argparse
@@ -184,8 +194,17 @@ Examples:
         action="store_true",
         help="Use Metal kernels (bitwise determinism) instead of Python wrapper",
     )
+    parser.add_argument(
+        "--no-determinism",
+        action="store_true",
+        help="Run without deterministic mode to show baseline variance",
+    )
 
     args = parser.parse_args()
+
+    # Mutual exclusivity check
+    if args.no_determinism and args.metal:
+        parser.error("--no-determinism and --metal are mutually exclusive")
 
     # Quick mode overrides - minimal for fast iteration
     if args.quick:
@@ -237,18 +256,26 @@ Examples:
     print("Model loaded!")
     print()
 
-    # Enable deterministic mode
-    if args.metal:
+    # Enable deterministic mode (or skip if --no-determinism)
+    if args.no_determinism:
+        print("Running in NON-DETERMINISTIC mode (no modifications)...")
+        print("WARNING: Expect different outputs across batch sizes!")
+        mode_str = "Non-deterministic (baseline)"
+    elif args.metal:
         print("Enabling deterministic mode (Metal kernels)...")
+        # Patch SDPA for models that use scaled_dot_product_attention (Qwen3, etc.)
+        enable_mlx_lm_deterministic_mode(split_size=256, verbose=args.verbose)
+        # Replace RMSNorm with Metal implementations
         config = DeterministicConfig(use_metal_kernels=True)
-        enable_deterministic_mode(model, config)
+        enable_deterministic_mode(model, config, verbose=args.verbose)
+        # Also replace quantized linear layers
+        replace_quantized_linear_layers(model, verbose=args.verbose)
         mode_str = "Metal kernels (bitwise)"
     else:
         print("Enabling deterministic mode (Python wrapper)...")
-        enable_mlx_lm_deterministic_mode(split_size=256)
-        replace_quantized_linear_layers(model)
+        enable_mlx_lm_deterministic_mode(split_size=256, verbose=args.verbose)
+        replace_quantized_linear_layers(model, verbose=args.verbose)
         mode_str = "Python wrapper (split_size=256)"
-    print("Deterministic mode enabled!")
     print()
 
     # Print configuration
@@ -320,7 +347,20 @@ Examples:
     print(f"Determinism: {pass_count}/{len(queries)} queries PASS")
     print()
 
-    if pass_count == len(queries):
+    if args.no_determinism:
+        # In non-deterministic mode, variance is expected
+        if pass_count < len(queries):
+            print("Variance detected across batch sizes (expected in non-deterministic mode):")
+            for r in results:
+                if not r["is_deterministic"]:
+                    print(f'  - "{r["name"]}": max diff = {r["max_diff"]:.6e}')
+            print()
+            print("This demonstrates why deterministic mode is needed.")
+        else:
+            print("No variance detected in non-deterministic mode.")
+            print("MLX may have improved determinism in recent versions (0.30+).")
+            print("This library ensures determinism across all MLX versions.")
+    elif pass_count == len(queries):
         print(f"All outputs are BITWISE IDENTICAL across batch sizes {batch_sizes}")
         print()
         print("The model is operating deterministically.")
@@ -335,6 +375,9 @@ Examples:
     print()
     print("=" * 70)
 
+    # In non-deterministic mode, variance is expected so return 0
+    if args.no_determinism:
+        return 0
     return 0 if pass_count == len(queries) else 1
 
 

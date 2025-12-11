@@ -96,7 +96,7 @@ class DeterministicConfig:
         self.use_metal_kernels = use_metal_kernels
 
 
-def enable_deterministic_mode(model, config: DeterministicConfig = None):
+def enable_deterministic_mode(model, config: DeterministicConfig = None, verbose: bool = False):
     """
     Enable deterministic mode for an MLX-LM model by replacing operations
     with batch-invariant versions.
@@ -109,6 +109,7 @@ def enable_deterministic_mode(model, config: DeterministicConfig = None):
     Args:
         model: MLX model to convert
         config: Configuration for deterministic operations
+        verbose: If True, print detailed replacement info (default: False)
 
     Returns:
         Modified model with deterministic operations
@@ -175,7 +176,8 @@ def enable_deterministic_mode(model, config: DeterministicConfig = None):
                     new_module.weight = child.weight
                     setattr(module, name, new_module)
                     replacement_count += 1
-                    print(f"Replaced {full_name} with BatchInvariantRMSNormMetal (bitwise deterministic)")
+                    if verbose:
+                        print(f"Replaced {full_name} with BatchInvariantRMSNormMetal (bitwise deterministic)")
                 else:
                     new_module = BatchInvariantRMSNorm(
                         dims=dims,
@@ -186,7 +188,8 @@ def enable_deterministic_mode(model, config: DeterministicConfig = None):
                     new_module.weight = child.weight
                     setattr(module, name, new_module)
                     replacement_count += 1
-                    print(f"Replaced {full_name} with BatchInvariantRMSNorm")
+                    if verbose:
+                        print(f"Replaced {full_name} with BatchInvariantRMSNorm")
 
             # Replace MultiHeadAttention
             elif isinstance(child, nn.MultiHeadAttention):
@@ -221,24 +224,26 @@ def enable_deterministic_mode(model, config: DeterministicConfig = None):
                     new_module.out_proj.bias = child.out_proj.bias
                 setattr(module, name, new_module)
                 replacement_count += 1
-                print(f"Replaced {full_name} with BatchInvariantAttention")
+                if verbose:
+                    print(f"Replaced {full_name} with BatchInvariantAttention")
 
             # Recursively process children
             elif hasattr(child, '__dict__'):
                 replace_modules(child, full_name)
 
     replace_modules(model)
-    print(f"\nDeterministic mode enabled ({replacement_count} modules replaced)")
-    print(f"Config:")
-    print(f"  RMSNorm chunk size: {config.rms_norm_chunk_size}")
-    print(f"  Matmul tile size: {config.matmul_tile_size}")
-    print(f"  Softmax chunk size: {config.softmax_chunk_size}")
-    print(f"  Attention matmul tile size: {config.attention_matmul_tile_size}")
+    if verbose:
+        print(f"\nDeterministic mode enabled ({replacement_count} modules replaced)")
+        print(f"Config:")
+        print(f"  RMSNorm chunk size: {config.rms_norm_chunk_size}")
+        print(f"  Matmul tile size: {config.matmul_tile_size}")
+        print(f"  Softmax chunk size: {config.softmax_chunk_size}")
+        print(f"  Attention matmul tile size: {config.attention_matmul_tile_size}")
 
     return model
 
 
-def enable_mlx_lm_deterministic_mode(split_size: int = 256):
+def enable_mlx_lm_deterministic_mode(split_size: int = 256, verbose: bool = False):
     """
     Enable batch-invariant attention for all MLX-LM models.
 
@@ -255,6 +260,7 @@ def enable_mlx_lm_deterministic_mode(split_size: int = 256):
         split_size: KV split size for flash attention (default: 256).
                    Smaller values = more deterministic but slower.
                    Larger values = faster but may have more numerical variance.
+        verbose: If True, print patching info (default: False)
 
     Example:
         >>> from mlx_deterministic import enable_mlx_lm_deterministic_mode
@@ -345,9 +351,10 @@ def enable_mlx_lm_deterministic_mode(split_size: int = 256):
                 module.scaled_dot_product_attention = patched_sdpa
                 patched_count += 1
 
-    print(f"MLX-LM deterministic attention enabled (split_size={split_size})")
-    if patched_count > 0:
-        print(f"  Patched {patched_count} already-imported model modules")
+    if verbose:
+        print(f"MLX-LM deterministic attention enabled (split_size={split_size})")
+        if patched_count > 0:
+            print(f"  Patched {patched_count} already-imported model modules")
 
 
 def disable_mlx_lm_deterministic_mode():
@@ -478,5 +485,6 @@ def replace_quantized_linear_layers(model, verbose: bool = False):
                 replace_in_module(child, full_name)
 
     replace_in_module(model)
-    print(f"Replaced {replaced_count} QuantizedLinear layers with DeterministicQuantizedLinear")
+    if verbose:
+        print(f"Replaced {replaced_count} QuantizedLinear layers with DeterministicQuantizedLinear")
     return model

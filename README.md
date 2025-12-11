@@ -151,6 +151,28 @@ python -m pytest mlx_deterministic/tests/test_metal_kernels.py -v
 python -m pytest mlx_deterministic/tests/test_matmul.py -v
 ```
 
+### Verifying Determinism
+
+Use the `determinism_check.py` script to verify batch-invariant inference on real models:
+
+```bash
+# Quick test with Metal kernels (recommended)
+python examples/determinism_check.py --metal --quick
+
+# Test a specific model
+python examples/determinism_check.py --metal --model mlx-community/Qwen3-4B-4bit
+
+# Full test with all batch sizes and verbose output
+python examples/determinism_check.py --metal --verbose --batch-sizes "1,2,4,8,16,32"
+
+# Test WITHOUT deterministic mode (shows baseline variance)
+python examples/determinism_check.py --no-determinism --verbose --quick
+```
+
+The `--no-determinism` flag runs models without any deterministic modifications, useful for demonstrating why this library exists. Some models (like Qwen3-0.6B) show significant variance (~0.75 logit difference) without deterministic mode.
+
+See [`examples/MLX_DETERMINISM_NOTES.md`](examples/MLX_DETERMINISM_NOTES.md) for historical context on MLX's batch determinism behavior.
+
 ## 📊 Benchmarking
 
 The benchmark suite validates determinism and measures performance across all implementations.
