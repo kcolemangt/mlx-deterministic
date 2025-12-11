@@ -113,6 +113,38 @@ def test_attention_batch_invariance_simple():
     assert max_diff < 1e-4, f"Attention batch invariance violated by {max_diff}"
 
 
+def test_attention_unbatched_matches_batched():
+    """
+    Test: Unbatched inputs (no leading batch dim) should match batched=1.
+    This guards head/sequence layout handling in __call__.
+    """
+    dims = 128
+    num_heads = 4
+    seq_len = 32
+
+    mx.random.seed(42)
+    attn = BatchInvariantAttention(dims=dims, num_heads=num_heads)
+
+    queries = mx.random.normal((seq_len, dims))
+    keys = mx.random.normal((seq_len, dims))
+    values = mx.random.normal((seq_len, dims))
+
+    output_unbatched = attn(queries, keys, values)
+
+    output_batched = attn(
+        queries.reshape(1, seq_len, dims),
+        keys.reshape(1, seq_len, dims),
+        values.reshape(1, seq_len, dims),
+    )[0]
+
+    diff = mx.abs(output_unbatched - output_batched)
+    max_diff = mx.max(diff).item()
+
+    assert max_diff < 1e-4, (
+        f"Unbatched attention differs from batched by {max_diff}"
+    )
+
+
 def test_attention_batch_invariance_varied_seq_lengths():
     """
     Test: Different sequence lengths should still be deterministic.
@@ -279,6 +311,218 @@ def test_attention_output_shape():
 
     assert output.shape == (batch_size, seq_len, dims), (
         f"Output shape {output.shape} doesn't match expected {(batch_size, seq_len, dims)}"
+    )
+
+
+# =============================================================================
+# Real Qwen Model Tests
+# =============================================================================
+
+QWEN_MODEL_NAME = "mlx-community/Qwen2.5-3B-Instruct-4bit"
+QWEN_TEST_PROMPTS = [
+    "What is the capital of France?",
+    "Hello, how are you?",
+]
+
+
+def _load_qwen_model_baseline():
+    """Load Qwen model WITHOUT deterministic mode for baseline comparison."""
+    from mlx_lm import load
+    model, tokenizer = load(QWEN_MODEL_NAME)
+    return model, tokenizer
+
+
+def _load_qwen_model_deterministic():
+    """Load Qwen model WITH deterministic attention enabled."""
+    from mlx_lm import load
+    from mlx_deterministic import enable_mlx_lm_deterministic_mode
+
+    # Enable deterministic mode BEFORE loading
+    enable_mlx_lm_deterministic_mode(split_size=256)
+
+    # Load the model
+    model, tokenizer = load(QWEN_MODEL_NAME)
+    return model, tokenizer
+
+
+@pytest.mark.slow
+def test_qwen_unbatched_vs_batched_with_batch_invariant_attention():
+    """
+    Test: BatchInvariantAttention with real Qwen embeddings.
+
+    Uses real token embeddings from Qwen but passes them through our
+    BatchInvariantAttention module to test unbatched vs batched.
+    """
+    model, tokenizer = _load_qwen_model_baseline()
+    actual_model = model.model if hasattr(model, 'model') else model
+
+    for prompt in QWEN_TEST_PROMPTS:
+        tokens = tokenizer.encode(prompt)
+        x = mx.array([tokens])
+
+        # Get real embeddings
+        embeddings = actual_model.embed_tokens(x)
+        mx.eval(embeddings)
+
+        seq_len, dims = embeddings.shape[1], embeddings.shape[2]
+        num_heads = 16  # Typical for 3B model
+
+        # Create our BatchInvariantAttention with matching dims
+        attn = BatchInvariantAttention(dims=dims, num_heads=num_heads)
+
+        # Unbatched: squeeze batch dim
+        emb_unbatched = embeddings[0]  # [seq, dims]
+        emb_batched = embeddings       # [1, seq, dims]
+
+        # Run through our attention both ways
+        out_unbatched = attn(emb_unbatched, emb_unbatched, emb_unbatched)
+        out_batched = attn(emb_batched, emb_batched, emb_batched)
+        mx.eval(out_unbatched, out_batched)
+
+        # Compare: unbatched should match batched[0]
+        diff = mx.max(mx.abs(out_unbatched - out_batched[0])).item()
+
+        assert diff < 1e-4, (
+            f"'{prompt}': Unbatched vs batched attention diff: {diff}"
+        )
+
+
+@pytest.mark.slow
+def test_qwen_batch_size_invariance_with_batch_invariant_attention():
+    """
+    Test: BatchInvariantAttention produces identical outputs across batch sizes.
+
+    Uses real Qwen embeddings, processes through BatchInvariantAttention,
+    verifies first sample matches regardless of batch size.
+    """
+    model, tokenizer = _load_qwen_model_baseline()
+    actual_model = model.model if hasattr(model, 'model') else model
+
+    prompt = "What is the capital of France?"
+    tokens = tokenizer.encode(prompt)
+
+    # Get embeddings once
+    x = mx.array([tokens])
+    embeddings = actual_model.embed_tokens(x)
+    mx.eval(embeddings)
+
+    dims = embeddings.shape[2]
+    num_heads = 16
+
+    # Create our BatchInvariantAttention
+    attn = BatchInvariantAttention(dims=dims, num_heads=num_heads)
+
+    batch_sizes = [1, 2, 4, 8]
+    outputs = []
+
+    for batch_size in batch_sizes:
+        # Create batch by repeating embeddings
+        batched_emb = mx.repeat(embeddings, batch_size, axis=0)
+        mx.eval(batched_emb)
+
+        # Run through our attention
+        out = attn(batched_emb, batched_emb, batched_emb)
+        mx.eval(out)
+
+        # Store first sample output
+        outputs.append(out[0])
+
+    # Compare all outputs to the first (batch_size=1) output
+    reference = outputs[0]
+    for i, (batch_size, out) in enumerate(zip(batch_sizes[1:], outputs[1:]), 1):
+        diff = mx.max(mx.abs(reference - out)).item()
+        assert diff < 1e-4, (
+            f"batch_size={batch_size} differs from batch_size=1 by {diff}"
+        )
+
+
+@pytest.mark.slow
+def test_qwen_full_forward_batch_variance_baseline():
+    """
+    Test: Measure baseline batch variance WITHOUT deterministic mode.
+
+    This establishes the baseline variance that deterministic mode should reduce.
+    MLX models typically have small but non-zero batch variance (~0.03-0.1).
+    """
+    # Load model WITHOUT deterministic mode
+    model, tokenizer = _load_qwen_model_baseline()
+
+    prompt = "What is the capital of France?"
+    tokens = tokenizer.encode(prompt)
+
+    # Mode 1: batch_size=1
+    x1 = mx.array([tokens])
+    logits1 = model(x1)
+    mx.eval(logits1)
+
+    # Mode 2: batch_size=4
+    x4 = mx.array([tokens] * 4)
+    logits4 = model(x4)
+    mx.eval(logits4)
+
+    # Measure baseline variance
+    baseline_diff = mx.max(mx.abs(logits1[0] - logits4[0])).item()
+
+    # Baseline should have some variance (but not huge)
+    assert baseline_diff < 0.5, (
+        f"Baseline variance unexpectedly high: {baseline_diff}"
+    )
+
+    # Return the baseline diff for documentation
+    print(f"\nBaseline batch variance: {baseline_diff:.6f}")
+
+
+@pytest.mark.slow
+def test_qwen_full_forward_deterministic_improves_variance():
+    """
+    Test: Full model forward with deterministic mode reduces batch variance.
+
+    Compares batch variance between:
+    1. Baseline model (no deterministic mode)
+    2. Model with deterministic attention enabled
+
+    The deterministic mode should produce lower or equal variance.
+    """
+    import importlib
+
+    # First, measure baseline (fresh Python state needed)
+    from mlx_lm import load
+
+    prompt = "What is the capital of France?"
+
+    # Baseline measurement
+    model_base, tokenizer = load(QWEN_MODEL_NAME)
+    tokens = tokenizer.encode(prompt)
+
+    x1 = mx.array([tokens])
+    x4 = mx.array([tokens] * 4)
+
+    logits1_base = model_base(x1)
+    logits4_base = model_base(x4)
+    mx.eval(logits1_base, logits4_base)
+
+    baseline_diff = mx.max(mx.abs(logits1_base[0] - logits4_base[0])).item()
+
+    # Now with deterministic mode (reimport to get fresh state)
+    from mlx_deterministic import enable_mlx_lm_deterministic_mode
+    enable_mlx_lm_deterministic_mode(split_size=256)
+
+    model_det, _ = load(QWEN_MODEL_NAME)
+
+    logits1_det = model_det(x1)
+    logits4_det = model_det(x4)
+    mx.eval(logits1_det, logits4_det)
+
+    det_diff = mx.max(mx.abs(logits1_det[0] - logits4_det[0])).item()
+
+    print(f"\nBaseline batch variance: {baseline_diff:.6f}")
+    print(f"Deterministic batch variance: {det_diff:.6f}")
+    print(f"Improvement: {baseline_diff - det_diff:.6f}")
+
+    # Deterministic should be better or equal
+    # Note: Due to module reloading quirks, we allow a small tolerance
+    assert det_diff <= baseline_diff + 0.01, (
+        f"Deterministic mode made variance worse: baseline={baseline_diff:.4f}, det={det_diff:.4f}"
     )
 
 

@@ -284,11 +284,8 @@ class BatchInvariantAttention(nn.Module):
             keys = keys.transpose(0, 2, 1, 3)
             values = values.transpose(0, 2, 1, 3)
         else:
-            # Handle unbatched case
-            queries = queries.transpose(-3, -2)
-            keys = keys.transpose(-3, -2)
-            values = values.transpose(-3, -2)
-            # Swap to get [num_heads, seq, head_dim]
+            # Handle unbatched or multi-batch-dim case
+            # [..., seq_len, num_heads, head_dim] -> [..., num_heads, seq_len, head_dim]
             queries = queries.swapaxes(-3, -2)
             keys = keys.swapaxes(-3, -2)
             values = values.swapaxes(-3, -2)
@@ -306,7 +303,6 @@ class BatchInvariantAttention(nn.Module):
             attn_output = attn_output.transpose(0, 2, 1, 3)
         else:
             attn_output = attn_output.swapaxes(-3, -2)
-            attn_output = attn_output.transpose(-3, -2)
 
         # Reshape to [..., seq_len, dims]
         attn_output = attn_output.reshape(*batch_dims, seq_len, dims)
