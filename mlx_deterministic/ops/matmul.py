@@ -7,8 +7,12 @@ ensuring deterministic outputs regardless of batch size.
 Based on Thinking Machines Labs research:
 https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/
 
-Research approach: Use 2D output tiling (M×N) instead of split-K. Each output
-tile computes a complete K-reduction, ensuring fixed computation order.
+Python path approach: Use fixed tiling over the K (reduction) dimension and
+accumulate partial products in a deterministic order. This prevents MLX from
+choosing batch-dependent split-K heuristics for large reductions.
+
+Metal path (`use_metal_kernel=True`) provides bitwise determinism using custom
+2D output-tiling kernels.
 """
 
 import mlx.core as mx
@@ -23,23 +27,16 @@ def batch_invariant_matmul(
     dtype: Optional[mx.Dtype] = None,
 ) -> mx.array:
     """
-    Batch-invariant matrix multiplication using 2D output tiling.
+    Batch-invariant matrix multiplication using fixed K-dimension tiling.
 
-    Research-aligned approach: Instead of split-K (splitting the reduction
-    dimension), we use 2D output tiling where each output tile computes a
-    complete K-reduction. This matches the TML research's approach of
-    "split output into 2D tiles, assign each to different core."
-
-    The key insight: Each output tile C[i:i+tile, j:j+tile] = A[i:i+tile, :] @ B[:, j:j+tile]
-    computes the full K-dimension reduction within the tile, avoiding any
-    inter-tile reduction that could vary with batch size.
+    We pad and split the reduction (K) dimension into fixed-size tiles, compute
+    partial products per tile, and sum them in a fixed order. This enforces a
+    deterministic reduction tree regardless of batch size.
 
     Args:
         a: Left matrix of shape [..., M, K] or [M, K]
         b: Right matrix of shape [K, N] or [..., K, N]
-        tile_size: Size of output tiles (used for both M and N dimensions).
-                   Previously was K-dimension tile; now repurposed for 2D tiling.
-                   Default: 64
+        tile_size: Tile size for the K (reduction) dimension. Default: 64
         use_metal_kernel: If True, use custom Metal kernel for bitwise-identical
                          determinism. If False (default), use Python tiling which
                          has ~1e-5 tolerance due to MLX's internal matmul variance.
@@ -73,51 +70,42 @@ def batch_invariant_matmul(
     K_b = b_shape[-2]
     assert K_a == K_b, f"Incompatible dimensions: {K_a} != {K_b}"
 
-    M = a_shape[-2]
-    N = b_shape[-1]
+    K = K_a
 
-    # For small matrices, use standard matmul (single tile = deterministic)
-    if M <= tile_size and N <= tile_size:
-        return mx.matmul(a, b)
+    # Pad K dimension to a multiple of tile_size
+    K_padded = ((K + tile_size - 1) // tile_size) * tile_size
+    pad_size = K_padded - K
 
-    # 2D output tiling: each tile computes complete K-reduction
-    tile_m = tile_size
-    tile_n = tile_size
+    if pad_size > 0:
+        # Pad matrix a along last dimension (K)
+        pad_shape_a = list(a_shape)
+        pad_shape_a[-1] = pad_size
+        a_padding = mx.zeros(pad_shape_a, dtype=a.dtype)
+        a_padded = mx.concatenate([a, a_padding], axis=-1)
 
-    # Compute number of tiles
-    num_tiles_m = (M + tile_m - 1) // tile_m
-    num_tiles_n = (N + tile_n - 1) // tile_n
+        # Pad matrix b along second-to-last dimension (K)
+        pad_shape_b = list(b_shape)
+        pad_shape_b[-2] = pad_size
+        b_padding = mx.zeros(pad_shape_b, dtype=b.dtype)
+        b_padded = mx.concatenate([b, b_padding], axis=-2)
+    else:
+        a_padded = a
+        b_padded = b
 
-    # Process tiles and collect results
-    # Each tile computes: C[m_start:m_end, n_start:n_end] = A[m_start:m_end, :] @ B[:, n_start:n_end]
-    rows = []
-    for i in range(num_tiles_m):
-        m_start = i * tile_m
-        m_end = min(m_start + tile_m, M)
+    num_tiles = K_padded // tile_size
+    accumulator = None
 
-        # Extract rows of A for this tile row
-        a_row = a[..., m_start:m_end, :]  # [..., tile_m, K]
+    for tile_idx in range(num_tiles):
+        k_start = tile_idx * tile_size
+        k_end = k_start + tile_size
 
-        cols = []
-        for j in range(num_tiles_n):
-            n_start = j * tile_n
-            n_end = min(n_start + tile_n, N)
+        a_tile = a_padded[..., :, k_start:k_end]
+        b_tile = b_padded[..., k_start:k_end, :]
 
-            # Extract columns of B for this tile
-            b_col = b[..., :, n_start:n_end]  # [..., K, tile_n]
+        partial_product = mx.matmul(a_tile, b_tile)
+        accumulator = partial_product if accumulator is None else accumulator + partial_product
 
-            # Complete K-reduction for this output tile
-            # This is the full dot product - no partial sums across tiles
-            tile_result = mx.matmul(a_row, b_col)  # [..., tile_m, tile_n]
-            cols.append(tile_result)
-
-        # Concatenate columns for this row
-        row_result = mx.concatenate(cols, axis=-1) if len(cols) > 1 else cols[0]
-        rows.append(row_result)
-
-    # Concatenate all rows
-    result = mx.concatenate(rows, axis=-2) if len(rows) > 1 else rows[0]
-    return result
+    return accumulator
 
 
 def batch_invariant_addmm(
@@ -137,12 +125,12 @@ def batch_invariant_addmm(
         b: Right matrix of shape [K, N] or [..., K, N]
         alpha: Multiplier for matmul result
         beta: Multiplier for bias
-        tile_size: Size of output tiles for 2D tiling
+        tile_size: Tile size for the K (reduction) dimension
 
     Returns:
         Result matrix of shape [..., M, N]
     """
-    # Compute batch-invariant matmul with 2D output tiling
+    # Compute batch-invariant matmul with fixed K tiling
     mm_result = batch_invariant_matmul(a, b, tile_size=tile_size)
 
     # Apply alpha and beta scaling and add bias
@@ -156,12 +144,12 @@ class BatchInvariantLinear:
     Batch-invariant linear layer (equivalent to nn.Linear but deterministic).
 
     This implements: y = x @ W^T + b (if bias exists)
-    using batch-invariant matrix multiplication with 2D output tiling.
+    using batch-invariant matrix multiplication with fixed K tiling.
 
     Args:
         weight: Weight matrix of shape [out_features, in_features]
         bias: Optional bias vector of shape [out_features]
-        tile_size: Size of output tiles for 2D tiling
+        tile_size: Tile size for the K (reduction) dimension
     """
 
     def __init__(
@@ -184,7 +172,7 @@ class BatchInvariantLinear:
         Returns:
             Output tensor of shape [..., out_features]
         """
-        # Compute x @ W^T using batch-invariant matmul with 2D output tiling
+        # Compute x @ W^T using batch-invariant matmul with fixed K tiling
         output = batch_invariant_matmul(x, self.weight.T, tile_size=self.tile_size)
 
         # Add bias if present
