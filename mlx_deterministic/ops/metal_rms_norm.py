@@ -19,12 +19,12 @@ Performance optimizations (v2 - M4 Max):
 
 import mlx.core as mx
 import mlx.nn as nn
-from typing import Optional
+from typing import Any, Dict, Optional
 
 # Metal kernel for deterministic RMSNorm (optimized for M4 Max)
 # Each threadgroup processes one sample with tree reduction
 # Note: eps is hardcoded since Metal kernels don't support float template args
-RMSNORM_KERNEL_SOURCE = """
+RMSNORM_KERNEL_SOURCE: str = """
 // Each threadgroup handles one sample (one row of input)
 uint sample_idx = threadgroup_position_in_grid.x;
 uint local_id = thread_position_in_threadgroup.x;
@@ -136,7 +136,7 @@ for (; i < dims; i += num_threads) {
 """
 
 # Kernel cache
-_kernel_cache = {}
+_kernel_cache: Dict[str, Any] = {}
 
 
 def _create_rmsnorm_kernel():

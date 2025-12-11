@@ -1,6 +1,6 @@
 # MLX Deterministic Inference
 
-[![Tests](https://img.shields.io/badge/tests-59%2F59%20passing-brightgreen)](mlx_deterministic/tests/)
+[![Tests](https://img.shields.io/badge/tests-62%2F65%20passing-brightgreen)](mlx_deterministic/tests/)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org/downloads/)
 [![MLX](https://img.shields.io/badge/MLX-0.29%2B-orange)](https://github.com/ml-explore/mlx)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
@@ -80,7 +80,7 @@ Matmul              ~1e-5 tolerance    0.0 (bitwise)          0.0 (bitwise)
 Softmax             ~1e-5 tolerance    0.0 (bitwise)          N/A
 Attention           <1e-4 tolerance    <1e-4 tolerance        N/A
 
-59/59 tests passing across all batch sizes [1, 2, 4, 8, 16, 32, 64, 128]
+65 tests (62 passing, 3 xfail for known limitations) across batch sizes [1, 2, 4, 8, 16, 32, 64, 128]
 ```
 
 ## 🚀 Quick Start

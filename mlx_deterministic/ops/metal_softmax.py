@@ -18,11 +18,11 @@ Performance optimizations (v2 - M4 Max):
 """
 
 import mlx.core as mx
-from typing import Optional
+from typing import Any, Dict, Optional
 
 # Metal kernel for deterministic softmax (optimized for M4 Max)
 # Each threadgroup processes one row with tree reductions for max and sum
-SOFTMAX_KERNEL_SOURCE = """
+SOFTMAX_KERNEL_SOURCE: str = """
 // Each threadgroup handles one row
 uint row_idx = threadgroup_position_in_grid.x;
 uint local_id = thread_position_in_threadgroup.x;
@@ -162,7 +162,7 @@ for (; i < cols; i += num_threads) {
 """
 
 # Kernel cache
-_kernel_cache = {}
+_kernel_cache: Dict[str, Any] = {}
 
 
 def _create_softmax_kernel():

@@ -23,7 +23,7 @@ Dequantization: w_float = (quant_val - bias) * scale
 
 import mlx.core as mx
 import mlx.nn as nn
-from typing import Optional
+from typing import Any, Dict, Optional
 
 # =============================================================================
 # QUANTIZED MATMUL KERNEL - FP16 with on-the-fly dequantization
@@ -31,7 +31,7 @@ from typing import Optional
 # This kernel performs: output = x @ dequantize(packed_w).T
 # where x is [batch, M, K] float16 and packed_w is [N, K/8] uint32
 
-QUANTIZED_MATMUL_KERNEL = """
+QUANTIZED_MATMUL_KERNEL: str = """
 #include <metal_simdgroup_matrix>
 
 // Tiling constants
@@ -175,7 +175,7 @@ for (int i = 0; i < 4; i++) {
 # =============================================================================
 # SIMPLE QUANTIZED KERNEL (fallback for small matrices)
 # =============================================================================
-QUANTIZED_MATMUL_KERNEL_SIMPLE = """
+QUANTIZED_MATMUL_KERNEL_SIMPLE: str = """
 // Each thread computes one output element
 uint row = thread_position_in_grid.y;
 uint col = thread_position_in_grid.x;
@@ -218,7 +218,7 @@ output[row * N_val + col] = acc;
 """
 
 # Kernel cache
-_kernel_cache = {}
+_kernel_cache: Dict[str, Any] = {}
 
 
 def _create_quantized_matmul_kernel():
@@ -298,12 +298,16 @@ def _quantized_matmul_2d(
     scales: mx.array,
     biases: mx.array,
 ) -> mx.array:
-    """
-    Core 2D quantized matmul.
+    """Perform 2D quantized matrix multiplication using Metal kernel.
 
-    x: [M, K] float16
-    packed_w: [N, K/8] uint32
-    output: [M, N] float16
+    Args:
+        x: Input tensor of shape [M, K] (float16)
+        packed_w: Quantized weights of shape [N, K/8] (uint32)
+        scales: Scale factors for dequantization
+        biases: Bias values for dequantization
+
+    Returns:
+        mx.array: Output tensor of shape [M, N] as float16
     """
     assert x.ndim == 2, f"Expected 2D input, got {x.ndim}D"
 

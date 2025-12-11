@@ -25,7 +25,7 @@ References:
 """
 
 import mlx.core as mx
-from typing import Optional
+from typing import Any, Dict, Optional
 
 # =============================================================================
 # SIMD GROUP MATRIX KERNEL - Hardware-accelerated 64x64 tiles
@@ -34,7 +34,7 @@ from typing import Optional
 # 4 simdgroups (128 threads) per threadgroup, each handling a 32x32 quadrant
 # Uses Apple's tensor core equivalent for ~10-100x throughput vs scalar ops
 
-MATMUL_KERNEL_SIMD = """
+MATMUL_KERNEL_SIMD: str = """
 #include <metal_simdgroup_matrix>
 
 // Tiling Constants - BK=16 provides best balance of shared memory and compute
@@ -173,7 +173,7 @@ for (int i = 0; i < 4; i++) {
 # 4 simdgroups (128 threads) per threadgroup, each handling a 32x32 quadrant
 # Uses same structure as FP32 kernel but with half precision for memory bandwidth
 
-MATMUL_KERNEL_SIMD_FP16 = """
+MATMUL_KERNEL_SIMD_FP16: str = """
 #include <metal_simdgroup_matrix>
 
 // Tiling Constants - same as FP32 (8x8 matrices are the hardware limit)
@@ -312,7 +312,7 @@ for (int i = 0; i < 4; i++) {
 # Uses register blocking for high arithmetic intensity
 # Kept as fallback for non-float32 types or if simdgroup fails
 
-MATMUL_KERNEL_OPTIMIZED = """
+MATMUL_KERNEL_OPTIMIZED: str = """
 // Optimized tiled matmul with register blocking
 // Uses 64x64 output tiles with 16x16 threads (256 threads per threadgroup)
 // Each thread computes a 4x4 sub-tile = 16 outputs
@@ -442,7 +442,7 @@ for (uint i = 0; i < TM; i++) {
 # For small matrices, the overhead of tiling is not worth it
 # This simple kernel is more efficient for M,N,K < 64
 
-MATMUL_KERNEL_SIMPLE = """
+MATMUL_KERNEL_SIMPLE: str = """
 // Each thread computes one output element C[row, col]
 uint row = thread_position_in_grid.y;
 uint col = thread_position_in_grid.x;
@@ -468,7 +468,7 @@ C[row * N_val + col] = acc;
 """
 
 # Legacy tiled kernel (16x16) - kept for reference
-MATMUL_KERNEL_TILED = """
+MATMUL_KERNEL_TILED: str = """
 // Tile dimensions - fixed for determinism
 #define TILE_SIZE 16
 
@@ -536,7 +536,7 @@ if (row < M_val && col < N_val) {
 """
 
 # Kernel cache to avoid recompilation
-_kernel_cache = {}
+_kernel_cache: Dict[str, Any] = {}
 
 
 def _create_simple_matmul_kernel():

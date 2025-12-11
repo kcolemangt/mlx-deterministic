@@ -29,8 +29,10 @@ from .ops import (
     softmax_metal,
 )
 
+from typing import Any, Callable, Optional
+
 # Store original function for restoration
-_ORIGINAL_SDPA = None
+_ORIGINAL_SDPA: Optional[Callable[..., Any]] = None
 
 __version__ = "0.3.0"  # Version bump for Metal kernel implementations
 
@@ -126,7 +128,12 @@ def enable_deterministic_mode(model, config: DeterministicConfig = None):
     replacement_count = 0
 
     def replace_modules(module, parent_name=""):
-        """Recursively replace modules with deterministic versions."""
+        """Recursively replace modules with deterministic versions.
+
+        Args:
+            module: The nn.Module to process
+            parent_name: Current path for logging (default: "")
+        """
         nonlocal replacement_count
 
         # Prevent infinite recursion from circular references (e.g., module.state returns self)
@@ -275,6 +282,20 @@ def enable_mlx_lm_deterministic_mode(split_size: int = 256):
 
     # Create wrapper with configured split_size
     def patched_sdpa(queries, keys, values, cache, scale, mask, sinks=None):
+        """Patched scaled dot-product attention using deterministic implementation.
+
+        Args:
+            queries: Query tensor
+            keys: Key tensor
+            values: Value tensor
+            cache: KV cache (optional)
+            scale: Attention scale factor
+            mask: Attention mask
+            sinks: Optional sink tokens for streaming
+
+        Returns:
+            Attention output tensor
+        """
         return scaled_dot_product_attention_deterministic(
             queries, keys, values, cache, scale, mask, sinks,
             split_size=split_size
@@ -377,6 +398,12 @@ def replace_quantized_linear_layers(model, verbose: bool = False):
     visited = set()
 
     def replace_in_module(module, parent_name=""):
+        """Recursively replace quantized linear layers in module.
+
+        Args:
+            module: The nn.Module to process
+            parent_name: Current path for logging (default: "")
+        """
         nonlocal replaced_count
 
         if id(module) in visited:
@@ -415,6 +442,14 @@ def replace_quantized_linear_layers(model, verbose: bool = False):
             elif isinstance(child, nn.QuantizedEmbedding):
                 # Create deterministic as_linear method
                 def make_det_as_linear(embed):
+                    """Create deterministic as_linear method for QuantizedEmbedding.
+
+                    Args:
+                        embed: QuantizedEmbedding layer to wrap
+
+                    Returns:
+                        Callable: Deterministic as_linear function
+                    """
                     def det_as_linear(x):
                         # The embedding weight is [vocab_size, embed_dim]
                         # as_linear computes: x @ W.T (transpose=True)
