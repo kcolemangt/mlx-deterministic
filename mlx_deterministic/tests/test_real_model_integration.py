@@ -335,7 +335,7 @@ class TestOriginalTraversal:
             sys.stdout = io.StringIO()
 
             try:
-                enable_deterministic_mode(model)
+                enable_deterministic_mode(model, verbose=True)
                 output = sys.stdout.getvalue()
                 replaced_count = output.count("Replaced")
             finally:
