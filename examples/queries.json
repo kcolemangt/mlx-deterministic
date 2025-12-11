@@ -1,0 +1,54 @@
+[
+  {
+    "name": "Ounces in a pound",
+    "query": "How many ounces in a pound?"
+  },
+  {
+    "name": "Basic greeting",
+    "query": "Hello, how are you today?"
+  },
+  {
+    "name": "Capital of France",
+    "query": "What is the capital of France?"
+  },
+  {
+    "name": "Capital of Italy",
+    "query": "What is the capital of Italy?"
+  },
+  {
+    "name": "Capital of Japan",
+    "query": "What is the capital of Japan?"
+  },
+  {
+    "name": "Simple math",
+    "query": "What is 2 + 2?"
+  },
+  {
+    "name": "Days in week",
+    "query": "How many days in a week?"
+  },
+  {
+    "name": "Months in year",
+    "query": "How many months in a year?"
+  },
+  {
+    "name": "Python function request",
+    "query": "Write a Python function to add two numbers"
+  },
+  {
+    "name": "Story prompt",
+    "query": "Once upon a time in a magical forest"
+  },
+  {
+    "name": "Classic pangram",
+    "query": "The quick brown fox jumps over the lazy dog"
+  },
+  {
+    "name": "Sky color",
+    "query": "What color is the sky?"
+  },
+  {
+    "name": "Shakespeare author",
+    "query": "Who wrote Romeo and Juliet?"
+  }
+]

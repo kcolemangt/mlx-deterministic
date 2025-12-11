@@ -39,32 +39,34 @@ if (sample_idx >= batch_size) {
     return;
 }
 
-// Shared memory for reduction - must be power of 2 for tree reduction
-threadgroup T shared_sum[256];
+// Shared memory for reduction - use float to avoid overflow with fp16 inputs
+// Must be power of 2 for tree reduction
+threadgroup float shared_sum[256];
 
 // Initialize shared memory to zero first
 // This is critical because threads >= dims won't write anything
-shared_sum[local_id] = T(0);
+shared_sum[local_id] = 0.0f;
 threadgroup_barrier(mem_flags::mem_threadgroup);
 
 // Each thread computes partial sum of squares
 // Process 4 elements at a time for better throughput
-T local_sum = T(0);
+// Use float accumulator to avoid overflow with fp16 inputs
+float local_sum = 0.0f;
 uint base = sample_idx * dims;
 
 // Main loop - process 4 elements per iteration
 uint i = local_id;
 for (; i + 3 * num_threads < dims; i += 4 * num_threads) {
-    T v0 = x[base + i];
-    T v1 = x[base + i + num_threads];
-    T v2 = x[base + i + 2 * num_threads];
-    T v3 = x[base + i + 3 * num_threads];
+    float v0 = float(x[base + i]);
+    float v1 = float(x[base + i + num_threads]);
+    float v2 = float(x[base + i + 2 * num_threads]);
+    float v3 = float(x[base + i + 3 * num_threads]);
     local_sum += v0 * v0 + v1 * v1 + v2 * v2 + v3 * v3;
 }
 
 // Handle remaining elements
 for (; i < dims; i += num_threads) {
-    T val = x[base + i];
+    float val = float(x[base + i]);
     local_sum += val * val;
 }
 
@@ -108,29 +110,29 @@ if (local_id < 1) {
 threadgroup_barrier(mem_flags::mem_threadgroup);
 
 // Now shared_sum[0] contains sum of all x^2 for this sample
-// Compute RMS: sqrt(mean(x^2) + eps)
-T mean_sq = shared_sum[0] / T(dims);
-T rms = metal::sqrt(mean_sq + eps[0]);
-T inv_rms = T(1) / rms;  // Pre-compute inverse for faster division
+// Compute RMS in float to avoid precision issues: sqrt(mean(x^2) + eps)
+float mean_sq = shared_sum[0] / float(dims);
+float rms = metal::sqrt(mean_sq + float(eps[0]));
+float inv_rms = 1.0f / rms;  // Pre-compute inverse for faster division
 
 // Each thread normalizes its portion of the output
 // Process 4 elements at a time
 i = local_id;
 for (; i + 3 * num_threads < dims; i += 4 * num_threads) {
-    T v0 = x[base + i];
-    T v1 = x[base + i + num_threads];
-    T v2 = x[base + i + 2 * num_threads];
-    T v3 = x[base + i + 3 * num_threads];
-    out[base + i] = v0 * inv_rms * weight[i];
-    out[base + i + num_threads] = v1 * inv_rms * weight[i + num_threads];
-    out[base + i + 2 * num_threads] = v2 * inv_rms * weight[i + 2 * num_threads];
-    out[base + i + 3 * num_threads] = v3 * inv_rms * weight[i + 3 * num_threads];
+    float v0 = float(x[base + i]);
+    float v1 = float(x[base + i + num_threads]);
+    float v2 = float(x[base + i + 2 * num_threads]);
+    float v3 = float(x[base + i + 3 * num_threads]);
+    out[base + i] = T(v0 * inv_rms * float(weight[i]));
+    out[base + i + num_threads] = T(v1 * inv_rms * float(weight[i + num_threads]));
+    out[base + i + 2 * num_threads] = T(v2 * inv_rms * float(weight[i + 2 * num_threads]));
+    out[base + i + 3 * num_threads] = T(v3 * inv_rms * float(weight[i + 3 * num_threads]));
 }
 
 // Handle remaining elements
 for (; i < dims; i += num_threads) {
-    T val = x[base + i];
-    out[base + i] = val * inv_rms * weight[i];
+    float val = float(x[base + i]);
+    out[base + i] = T(val * inv_rms * float(weight[i]));
 }
 """
 

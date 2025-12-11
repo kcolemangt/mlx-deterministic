@@ -306,6 +306,104 @@ class TestMetalRMSNorm:
         assert diff == 0.0, f"Module not bitwise identical: diff = {diff}"
 
 
+class TestMetalRMSNormFP16Overflow:
+    """Regression tests for fp16 overflow bug in Metal RMSNorm.
+
+    Bug: When input values are large (max > ~32), sum of squares in fp16
+    overflows to inf, causing output to be all zeros (1/inf = 0).
+
+    Fix: Accumulate in float32 regardless of input dtype.
+
+    This bug was fixed in commit that changed metal_rms_norm.py to use
+    float accumulators instead of T (half) for the sum-of-squares reduction.
+    """
+
+    def test_fp16_large_values_no_overflow(self):
+        """Test that large fp16 inputs don't cause overflow/zero output.
+
+        Before the fix, values with max > ~32 would cause overflow in fp16
+        accumulation, resulting in all-zero output.
+        """
+        for scale in [50, 100, 500, 1000]:
+            x = mx.random.normal((2, 4, 2048)).astype(mx.float16) * scale
+            weight = mx.ones((2048,), dtype=mx.float16)
+            out = rms_norm_metal(x, weight, 1e-6)
+            mx.eval(out)
+
+            assert not mx.all(out == 0).item(), (
+                f"Output all zeros at scale {scale} - fp16 overflow bug regression"
+            )
+            assert not mx.any(mx.isnan(out)).item(), f"Output has NaN at scale {scale}"
+            assert not mx.any(mx.isinf(out)).item(), f"Output has Inf at scale {scale}"
+
+    def test_fp16_matches_standard_rmsnorm_large_values(self):
+        """Ensure Metal RMSNorm matches nn.RMSNorm for large fp16 inputs."""
+        import mlx.nn as nn
+
+        mx.random.seed(42)
+        x = mx.random.normal((1, 1, 2048)).astype(mx.float16) * 100
+        weight = mx.ones((2048,), dtype=mx.float16)
+
+        # Standard RMSNorm (reference)
+        std_norm = nn.RMSNorm(2048, eps=1e-6)
+        std_norm.weight = weight
+        std_out = std_norm(x)
+
+        # Metal RMSNorm
+        metal_out = rms_norm_metal(x, weight, 1e-6)
+        mx.eval(std_out, metal_out)
+
+        # Should be close (fp16 precision allows small differences)
+        diff = mx.max(mx.abs(std_out - metal_out)).item()
+        assert diff < 0.01, f"Metal differs from standard by {diff} for large fp16 inputs"
+
+    def test_fp16_batch_invariance_large_values(self):
+        """Verify batch invariance holds with large fp16 values.
+
+        Even with large values that previously caused overflow, batch
+        invariance should be maintained.
+        """
+        mx.random.seed(42)
+        x = mx.random.normal((1, 4, 2048)).astype(mx.float16) * 200
+        weight = mx.ones((2048,), dtype=mx.float16)
+
+        # Create batched version
+        x_batch = mx.broadcast_to(x, (8,) + x.shape[1:])
+
+        out_single = rms_norm_metal(x, weight, 1e-6)
+        out_batch = rms_norm_metal(x_batch, weight, 1e-6)
+        mx.eval(out_single, out_batch)
+
+        # Should be bitwise identical
+        diff = mx.max(mx.abs(out_single[0] - out_batch[0])).item()
+        assert diff == 0.0, f"Batch invariance failed for large fp16 values: diff = {diff}"
+
+    def test_fp16_extreme_values_near_fp16_max(self):
+        """Test with values that approach fp16 max range.
+
+        fp16 max is ~65504. Values of ~250 squared times 2048 elements
+        would be ~128M, far exceeding fp16 max if accumulated in fp16.
+        """
+        mx.random.seed(42)
+        # Use values that would definitely overflow in fp16 accumulation
+        # 250^2 * 2048 = 128,000,000 >> 65504 (fp16 max)
+        x = mx.random.uniform(low=-250, high=250, shape=(1, 1, 2048)).astype(mx.float16)
+        weight = mx.ones((2048,), dtype=mx.float16)
+
+        out = rms_norm_metal(x, weight, 1e-6)
+        mx.eval(out)
+
+        # Output should be valid (not zeros, NaN, or Inf)
+        assert not mx.all(out == 0).item(), "Output all zeros - fp16 overflow bug"
+        assert not mx.any(mx.isnan(out)).item(), "Output has NaN"
+        assert not mx.any(mx.isinf(out)).item(), "Output has Inf"
+
+        # RMSNorm normalizes, so output should have reasonable magnitude
+        max_out = mx.max(mx.abs(out)).item()
+        assert max_out > 0.1, f"Output magnitude too small: {max_out}"
+        assert max_out < 100, f"Output magnitude too large: {max_out}"
+
+
 class TestMetalSoftmax:
     """Tests for deterministic softmax Metal kernel."""
 
